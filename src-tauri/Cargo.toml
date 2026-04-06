@@ -1,0 +1,28 @@
+[package]
+name = "pawkit"
+version = "0.1.0"
+description = "Desktop pet with customizable quick actions"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "pawkit_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+notify = "7"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+open = "5"
+dirs = "6"
+chrono = "0.4"
+tokio = { version = "1", features = ["process", "io-util", "rt"] }
+regex-lite = "0.1"

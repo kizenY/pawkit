@@ -1,0 +1,19 @@
+# Pawkit Actions Configuration
+# This file defines all quick actions available in the pet's right-click menu.
+# See docs/CONFIG.md for full schema reference.
+# This file is hot-reloaded — changes take effect immediately.
+
+actions:
+  - id: example-hello
+    name: "Hello World"
+    icon: "👋"
+    type: shell
+    command: "echo Hello from Pawkit!"
+    group: "示例"
+
+  - id: example-open-github
+    name: "打开 GitHub"
+    icon: "🐙"
+    type: url
+    url: "https://github.com"
+    group: "示例"
