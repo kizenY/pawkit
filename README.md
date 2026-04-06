@@ -1,70 +1,71 @@
 # 🐾 Pawkit
 
-**让 Claude Code 脱离终端束缚，把你的 AI Agent 装进兜里。**
+**Unleash Claude Code from the terminal. Put your AI Agent in your pocket.**
 
 [![GitHub stars](https://img.shields.io/github/stars/kizenY/pawkit?style=flat-square)](https://github.com/kizenY/pawkit/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
----
-
-## 😫 用的很爽，但也很烦？
-
-如果你在使用 Claude Code 或类似的 AI CLI 编程工具，你一定经历过这些痛苦：
-
-* **"盯盘"焦虑**：明明 AI 在写代码，你却得一直死守在屏幕前，等它弹出一个 `Approve? [y/n]`。
-* **物理束缚**：代码写到一半想出门？对不起，你得守在电脑前。
-* **远程无力**：人在外面，突然想让家里的电脑跑个测试、改个 Bug，终端却不可触达。
-
-**Pawkit 就是为了终结这些困扰而生的。**
-
-一只桌面小猫 + Claude Code 的远程控制手柄。Built with Tauri v2 + Vue 3 + Rust.
+**[中文文档](README_CN.md)**
 
 ---
 
-## 🚀 核心功能
+## 😫 Love it, but hate the friction?
 
-### 📱 不盯盘的 AI 编程
+If you use Claude Code or similar AI CLI tools, you know the pain:
 
-Pawkit 作为 Claude Code 的 Auth Proxy（`localhost:9527`），接管所有工具权限请求：
+* **"Screen-watching" anxiety** — AI is writing code, but you're glued to the screen waiting for `Approve? [y/n]`.
+* **Physically stuck** — Want to step out mid-session? Too bad, you need to babysit the terminal.
+* **Can't reach it remotely** — You're out, and suddenly need your home machine to run a test or fix a bug. The terminal is unreachable.
 
-- **安全工具自动放行** — Read、Glob、Grep 等只读操作静默通过
-- **智能 Bash 分析** — `ls`、`git status` 自动放行；`rm`、`git push`、`sudo` 需要审批
-- **桌面小猫弹窗** — 非安全工具在小猫上弹出 Allow / Allow All / Deny，不再阻塞终端
-- **Allow All** — 一键放行该工具类型的所有后续请求（本次会话内）
+**Pawkit exists to end these frustrations.**
 
-### 🌍 出门也能 Coding
+A desktop pet cat + remote control for Claude Code. Built with Tauri v2 + Vue 3 + Rust.
 
-右键小猫 →「外出模式」，Pawkit 通过 Slack Socket Mode 连接你的手机：
+---
 
-- **Slack DM 对话** — 在手机上直接和 Claude Code 聊天，发指令
-- **远程审批** — 危险操作通过 Slack 按钮审批（原地更新，不刷屏）
-- **会话继承** — 自动恢复你离开前的终端会话
-- **输出转发** — Claude Code 的任务结果实时推送到 Slack
-- **线程管理** — 新消息开新会话，thread 回复延续当前会话
+## 🚀 Core Features
 
-### 🔔 状态推送
+### 📱 Stop Babysitting the Terminal
 
-AI 完成了长任务，或者卡在了某个权限申请？
+Pawkit runs as Claude Code's Auth Proxy (`localhost:9527`), intercepting all tool permission requests:
 
-- **回家模式**：小猫挂上铃铛，点击消除
-- **外出模式**：结果直接推送到 Slack
+- **Safe tools auto-approved** — Read, Glob, Grep and other read-only tools pass silently
+- **Smart Bash analysis** — `ls`, `git status` auto-approved; `rm`, `git push`, `sudo` require approval
+- **Desktop cat popup** — Unsafe tools show Allow / Allow All / Deny on the cat, without blocking the terminal
+- **Allow All** — One-click to auto-approve all future requests for that tool type (current session)
+
+### 🌍 Code From Anywhere
+
+Right-click the cat → "Away Mode". Pawkit connects to your phone via Slack Socket Mode:
+
+- **Slack DM chat** — Talk to Claude Code from your phone, send instructions
+- **Remote approval** — Dangerous operations approved via Slack buttons (updated in-place, no spam)
+- **Session inheritance** — Automatically resumes your last terminal session
+- **Output forwarding** — Claude Code results pushed to Slack in real-time
+- **Thread management** — New messages start new sessions, thread replies continue the current one
+
+### 🔔 Status Notifications
+
+AI finished a long task, or stuck waiting for approval?
+
+- **Home mode**: Cat gets a bell icon, click to dismiss
+- **Away mode**: Results pushed directly to Slack
 
 ### 🤖 Auto Review
 
-Pawkit 每 5 分钟自动巡查 GitHub：
+Pawkit polls GitHub every 5 minutes:
 
-1. 发现需要你 review 的 PR 或 @mention 你的评论
-2. 小猫弹窗（或 Slack 通知）让你选择 Handle / Skip
-3. 点 Handle → Claude Code 自动读 diff、分析、提交 review
-4. 每个动作（review、comment、merge）都经过 Auth Proxy 等你审批
+1. Discovers PRs requesting your review, or comments @mentioning you
+2. Cat popup (or Slack notification) lets you choose Handle / Skip
+3. Handle → Claude Code reads the diff, analyzes, and submits a review
+4. Every action (review, comment, merge) goes through the Auth Proxy for your approval
 
-### ⚡ 自定义快捷操作
+### ⚡ Custom Quick Actions
 
-右键小猫触发你定义的快捷操作，`config/actions.yaml` 热加载：
+Right-click the cat to trigger actions defined in `config/actions.yaml` (hot-reloaded):
 
 ```yaml
 actions:
-  # 一键部署
   - id: deploy-dev
     name: "Server → Dev"
     icon: "🚀"
@@ -72,7 +73,6 @@ actions:
     command: "gh workflow run deploy_dev.yml --repo MyOrg/my-repo --ref main"
     group: "Deploy"
 
-  # 危险操作带确认框
   - id: deploy-prod
     name: "Server → Prod"
     icon: "🔴"
@@ -82,17 +82,17 @@ actions:
     group: "Deploy"
 ```
 
-支持的 action 类型：`shell`、`script`、`url`、`http`、`pipeline`
+Supported action types: `shell`, `script`, `url`, `http`, `pipeline`
 
 ---
 
-## 🔧 快速开始
+## 🔧 Getting Started
 
-### 安装
+### Install
 
-从 [Releases](../../releases) 下载最新安装包。
+Download the latest installer from [Releases](../../releases).
 
-### 开发
+### Development
 
 ```bash
 git clone https://github.com/kizenY/pawkit.git
@@ -101,15 +101,15 @@ pnpm install
 pnpm tauri dev
 ```
 
-### 构建
+### Build
 
 ```bash
 pnpm tauri build
 ```
 
-### 配置 Claude Code Hook
+### Configure Claude Code Hook
 
-将以下内容添加到 `~/.claude/settings.json`：
+Add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -140,9 +140,9 @@ pnpm tauri build
 }
 ```
 
-### 配置 Slack 远程模式
+### Configure Slack Remote Mode
 
-`config/slack.yaml`：
+`config/slack.yaml`:
 
 ```yaml
 bot_token: "xoxb-..."
@@ -153,11 +153,11 @@ critical_tools:
   - Bash
 ```
 
-所需 Slack App 权限：`chat:write`、`im:history`、`im:read`、`im:write`、`connections:write`。添加 `assistant:write` 以支持输入状态指示。
+Required Slack app scopes: `chat:write`, `im:history`, `im:read`, `im:write`, `connections:write`. Add `assistant:write` for typing indicator support.
 
-### 配置 Auto Review
+### Configure Auto Review
 
-`config/auto_review.yaml`：
+`config/auto_review.yaml`:
 
 ```yaml
 enabled: true
@@ -170,23 +170,23 @@ repo_dirs:
 
 ---
 
-## 🤝 参与贡献
+## 🤝 Contributing
 
-这是一个为了解决"开发者自己的烦恼"而诞生的项目。欢迎加入：
+This project was born from a developer's own frustrations. If you share them, join in:
 
-* **提个需求**：开个 Issue 告诉我你最想解决的痛点
-* **修个 Bug**：欢迎直接提 PR
-* **Roadmap**：
-    - [ ] macOS / Linux 支持
-    - [ ] 深度适配更多 CLI Agent (Aider 等)
-    - [ ] 手机端快捷操作面板
-    - [ ] 实时终端日志回溯
+* **Feature request** — Open an Issue with your pain point
+* **Found a bug** — PRs welcome
+* **Roadmap**:
+    - [ ] macOS / Linux support
+    - [ ] Deeper integration with more CLI agents (Aider, etc.)
+    - [ ] Mobile quick-action panel
+    - [ ] Real-time terminal log replay
 
 ---
 
-## ⭐ 别忘了给个 Star！
+## ⭐ Don't forget to Star!
 
-如果 Pawkit 帮你省下了盯着黑框框的时间，或者让你能安心出门喝杯咖啡，请点个 **Star** 支持一下！
+If Pawkit saved you from staring at a black terminal, or let you step out for a coffee in peace, please give it a **Star**!
 
 ---
 
