@@ -27,6 +27,8 @@ A desktop pet cat + remote control for Claude Code. Built with Tauri v2 + Vue 3 
 
 ### 📱 Stop Babysitting the Terminal
 
+<img src="docs/images/auth-proxy.png" width="200" alt="Auth proxy popup" />
+
 Pawkit runs as Claude Code's Auth Proxy (`localhost:9527`), intercepting all tool permission requests:
 
 - **Safe tools auto-approved** — Read, Glob, Grep and other read-only tools pass silently
@@ -53,6 +55,8 @@ AI finished a long task, or stuck waiting for approval?
 
 ### 🤖 Auto Review
 
+<img src="docs/images/auto-review.png" width="200" alt="Auto review notification" />
+
 Pawkit polls GitHub every 5 minutes:
 
 1. Discovers PRs requesting your review, or comments @mentioning you
@@ -61,6 +65,8 @@ Pawkit polls GitHub every 5 minutes:
 4. Every action (review, comment, merge) goes through the Auth Proxy for your approval
 
 ### ⚡ Custom Quick Actions
+
+<img src="docs/images/context-menu.png" width="200" alt="Right-click context menu" />
 
 Right-click the cat to trigger actions defined in `config/actions.yaml` (hot-reloaded):
 

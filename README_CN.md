@@ -27,6 +27,8 @@
 
 ### 📱 不盯盘的 AI 编程
 
+<img src="docs/images/auth-proxy.png" width="200" alt="Auth proxy 弹窗" />
+
 Pawkit 作为 Claude Code 的 Auth Proxy（`localhost:9527`），接管所有工具权限请求：
 
 - **安全工具自动放行** — Read、Glob、Grep 等只读操作静默通过
@@ -53,6 +55,8 @@ AI 完成了长任务，或者卡在了某个权限申请？
 
 ### 🤖 Auto Review
 
+<img src="docs/images/auto-review.png" width="200" alt="Auto review 通知" />
+
 Pawkit 每 5 分钟自动巡查 GitHub：
 
 1. 发现需要你 review 的 PR 或 @mention 你的评论
@@ -61,6 +65,8 @@ Pawkit 每 5 分钟自动巡查 GitHub：
 4. 每个动作（review、comment、merge）都经过 Auth Proxy 等你审批
 
 ### ⚡ 自定义快捷操作
+
+<img src="docs/images/context-menu.png" width="200" alt="右键菜单" />
 
 右键小猫触发你定义的快捷操作，`config/actions.yaml` 热加载：
 
