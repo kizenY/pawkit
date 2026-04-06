@@ -149,18 +149,27 @@ impl ClaudeSession {
         }
     }
 
-    /// Build command that reads prompt from a temp file via git-bash.
-    /// Uses `claude -p "$(cat file)"`, completely avoiding cmd.exe escaping issues.
+    /// Build command that reads prompt from a temp file via shell.
+    /// Uses `claude -p "$(cat file)"`, avoiding shell escaping issues.
     fn build_command_piped(&self, file_path: &std::path::Path) -> Command {
-        let bash_path = Self::find_git_bash();
+        let file_str = file_path.to_string_lossy();
 
-        // Convert Windows path to Unix path for bash (C:\Users\... → /c/Users/...)
-        let file_str = file_path.to_string_lossy().replace('\\', "/");
-        let unix_path = if file_str.len() >= 2 && file_str.as_bytes()[1] == b':' {
-            // C:/... → /c/...
-            format!("/{}/{}", &file_str[0..1].to_lowercase(), &file_str[3..])
-        } else {
-            file_str.to_string()
+        #[cfg(target_os = "windows")]
+        let (shell, unix_path) = {
+            let bash_path = Self::find_git_bash();
+            // Convert Windows path to Unix path for bash (C:\Users\... → /c/Users/...)
+            let fstr = file_str.replace('\\', "/");
+            let upath = if fstr.len() >= 2 && fstr.as_bytes()[1] == b':' {
+                format!("/{}/{}", &fstr[0..1].to_lowercase(), &fstr[3..])
+            } else {
+                fstr
+            };
+            (bash_path, upath)
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let (shell, unix_path) = {
+            ("/bin/bash".to_string(), file_str.to_string())
         };
 
         let mut shell_cmd = format!(
@@ -174,21 +183,22 @@ impl ClaudeSession {
             shell_cmd.push_str(" --continue");
         }
 
-        let mut cmd = Command::new(&bash_path);
+        let mut cmd = Command::new(&shell);
         cmd.arg("-c").arg(&shell_cmd);
         cmd.current_dir(&self.working_dir);
-        cmd.env("CLAUDE_CODE_GIT_BASH_PATH", &bash_path);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
         #[cfg(target_os = "windows")]
         {
+            cmd.env("CLAUDE_CODE_GIT_BASH_PATH", &shell);
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
         cmd
     }
 
+    #[cfg(target_os = "windows")]
     fn find_git_bash() -> String {
         if let Ok(path) = std::env::var("CLAUDE_CODE_GIT_BASH_PATH") {
             return path;
@@ -204,48 +214,6 @@ impl ClaudeSession {
             }
         }
         "bash".to_string()
-    }
-
-    #[allow(dead_code)]
-    fn build_command(&self, prompt: &str) -> Command {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg("claude");
-        cmd.arg("-p").arg(prompt);
-        cmd.arg("--output-format").arg("json");
-
-        if let Some(ref sid) = self.session_id {
-            cmd.arg("--resume").arg(sid);
-        } else if self.use_continue {
-            cmd.arg("--continue");
-        }
-
-        cmd.current_dir(&self.working_dir);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        // Claude Code on Windows needs git-bash
-        // Try common paths if env var is not already set
-        if std::env::var("CLAUDE_CODE_GIT_BASH_PATH").is_err() {
-            let candidates = [
-                r"E:\develop\kit\Git\bin\bash.exe",
-                r"C:\Program Files\Git\bin\bash.exe",
-                r"C:\Program Files (x86)\Git\bin\bash.exe",
-            ];
-            for path in &candidates {
-                if std::path::Path::new(path).exists() {
-                    cmd.env("CLAUDE_CODE_GIT_BASH_PATH", path);
-                    break;
-                }
-            }
-        }
-
-        // Hide the console window on Windows
-        #[cfg(target_os = "windows")]
-        {
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-
-        cmd
     }
 }
 
