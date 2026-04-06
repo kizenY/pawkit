@@ -9,3 +9,18 @@ actions:
     icon: "🐱"
     type: meow
 
+  - id: seesaw-deploy-dev
+    name: "Server → Dev"
+    icon: "🚀"
+    type: shell
+    command: "gh workflow run server_deploy_dev.yml --repo SeesawTech/seesaw-main --ref main"
+    group: "SeeSaw Deploy"
+
+  - id: seesaw-deploy-prod
+    name: "Server → Prod"
+    icon: "🔴"
+    type: shell
+    command: "gh workflow run server_deploy_prod.yml --repo SeesawTech/seesaw-main --ref main -f confirm=deploy-prod"
+    confirm: true
+    group: "SeeSaw Deploy"
+

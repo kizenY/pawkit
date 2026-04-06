@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import Pet from "./components/Pet.vue";
 import AuthNotification from "./components/AuthNotification.vue";
+import ReviewNotification from "./components/ReviewNotification.vue";
 import { ref, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -116,6 +117,7 @@ onUnmounted(() => {
   <div class="app" @contextmenu="onContextMenu" @click="onClick">
     <Pet :state="petState" :show-bell="hasUnread" />
     <AuthNotification v-if="!isAway" @auth-active="onAuthActive" />
+    <ReviewNotification v-if="!isAway && !authActive" />
   </div>
 </template>
 

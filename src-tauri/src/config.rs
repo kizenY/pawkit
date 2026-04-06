@@ -247,6 +247,47 @@ impl Default for SlackConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoReviewConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_review_interval")]
+    pub interval_minutes: u64,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    #[serde(default)]
+    pub repo_dirs: HashMap<String, String>,
+}
+
+fn default_review_interval() -> u64 { 5 }
+
+impl Default for AutoReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: default_review_interval(),
+            repos: Vec::new(),
+            repo_dirs: HashMap::new(),
+        }
+    }
+}
+
+pub fn load_auto_review_config(config_dir: &PathBuf) -> AutoReviewConfig {
+    let path = config_dir.join("auto_review.yaml");
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            match serde_yaml::from_str::<AutoReviewConfig>(&content) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("Failed to parse auto_review.yaml: {}", e);
+                    AutoReviewConfig::default()
+                }
+            }
+        }
+        Err(_) => AutoReviewConfig::default(),
+    }
+}
+
 pub fn load_all_config() -> AppConfig {
     let config_dir = get_config_dir();
     AppConfig {

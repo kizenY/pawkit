@@ -241,17 +241,39 @@ fn is_safe_bash_command(tool_input: &Option<serde_json::Value>) -> bool {
 }
 
 /// Handle Claude Code notification (task completed, etc.)
+/// In away mode, forward the notification content to Slack.
 async fn handle_notification(
     State(state): State<AppState>,
-    Json(input): Json<HookInput>,
+    Json(payload): Json<serde_json::Value>,
 ) -> StatusCode {
+    println!("[Pawkit] Notification payload: {}", serde_json::to_string(&payload).unwrap_or_default());
+
     // Capture session ID from notifications too — but only from terminal sessions
-    if let Some(ref sid) = input.session_id {
+    let session_id = payload.get("session_id").and_then(|v| v.as_str());
+    if let Some(sid) = session_id {
         if !state.is_away.load(Ordering::SeqCst) {
             save_last_terminal_session(sid);
             *state.last_terminal_session.lock().await = load_last_terminal_session();
         }
     }
+
+    // In away mode, forward notification content to Slack
+    if state.is_away.load(Ordering::SeqCst) {
+        if let Some(ref slack) = state.slack {
+            // Try to extract useful text from the notification
+            // Claude Code may send: message, result, or other fields
+            let message = payload.get("message").and_then(|v| v.as_str())
+                .or_else(|| payload.get("result").and_then(|v| v.as_str()))
+                .or_else(|| payload.get("text").and_then(|v| v.as_str()));
+
+            if let Some(msg) = message {
+                if !msg.is_empty() {
+                    let _ = slack.reply(&format!("🔔 {}", msg)).await;
+                }
+            }
+        }
+    }
+
     let _ = state.app_handle.emit("claude_task_done", ());
     StatusCode::OK
 }

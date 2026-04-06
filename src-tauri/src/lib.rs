@@ -1,3 +1,4 @@
+mod auto_review;
 mod config;
 mod executor;
 mod hook_server;
@@ -112,6 +113,38 @@ async fn respond_auth_all(
     } else {
         Ok(false)
     }
+}
+
+#[tauri::command]
+async fn approve_review_item(
+    id: String,
+    pending_reviews: tauri::State<'_, auto_review::PendingReviewItems>,
+) -> Result<bool, String> {
+    let item = {
+        let mut items = pending_reviews.lock().await;
+        let pos = items.iter().position(|i| i.id == id);
+        pos.map(|p| items.remove(p))
+    };
+    if let Some(item) = item {
+        if let Some(tx) = auto_review::get_approved_sender() {
+            let _ = tx.send(item).await;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[tauri::command]
+async fn skip_review_item(
+    id: String,
+    pending_reviews: tauri::State<'_, auto_review::PendingReviewItems>,
+) -> Result<bool, String> {
+    let mut items = pending_reviews.lock().await;
+    if let Some(pos) = items.iter().position(|i| i.id == id) {
+        items.remove(pos);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[tauri::command]
@@ -321,8 +354,13 @@ pub fn run() {
         hook_server::load_last_terminal_session(),
     ));
 
-    // Load Slack config and create bridge (if configured)
+    // Load auto-review config
     let config_dir = config::get_config_dir();
+    let auto_review_config = config::load_auto_review_config(&config_dir);
+    let pending_review_items: auto_review::PendingReviewItems =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    // Load Slack config and create bridge (if configured)
     let slack_config = config::load_slack_config(&config_dir);
     let slack_bridge: Option<Arc<SlackBridge>> =
         if !slack_config.bot_token.is_empty() && !slack_config.dm_user_id.is_empty() {
@@ -342,6 +380,7 @@ pub fn run() {
         .manage(pending_requests.clone())
         .manage(AwayFlag(is_away.clone()))
         .manage(session_allow_tools.clone())
+        .manage(pending_review_items.clone())
         .invoke_handler(tauri::generate_handler![
             get_actions,
             get_pet_config,
@@ -349,6 +388,8 @@ pub fn run() {
             reload_config,
             show_context_menu,
             respond_auth,
+            approve_review_item,
+            skip_review_item,
             respond_auth_all,
             get_hook_port,
             focus_claude_terminal,
@@ -381,6 +422,15 @@ pub fn run() {
                 slack_config.critical_tools.clone(),
                 last_terminal_session.clone(),
                 session_allow_tools.clone(),
+            );
+
+            // Start auto-review polling
+            auto_review::start_auto_review(
+                app_handle.clone(),
+                auto_review_config.clone(),
+                pending_review_items.clone(),
+                slack_bridge.clone(),
+                is_away.clone(),
             );
 
             // Poll foreground window to detect when user switches to Claude terminal

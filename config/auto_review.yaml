@@ -1,0 +1,16 @@
+# Auto Review Configuration
+# Pawkit will periodically check GitHub for review requests and @mentions,
+# then use Claude Code to handle them (with your approval via the cat UI).
+
+enabled: true
+interval_minutes: 5
+
+# Repos to watch for review requests
+repos:
+  - SeesawTech/seesaw-main
+  - SeesawTech/seesaw-server
+
+# Working directories for each repo (Claude Code needs to run in the right dir)
+repo_dirs:
+  SeesawTech/seesaw-main: "E:\\develop\\code\\seesaw\\seesaw-main"
+  SeesawTech/seesaw-server: "E:\\develop\\code\\seesaw\\seesaw-main\\server"
