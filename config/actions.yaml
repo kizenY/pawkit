@@ -9,9 +9,3 @@ actions:
     icon: "🐱"
     type: meow
 
-  - id: example-open-github
-    name: "打开 GitHub"
-    icon: "🐙"
-    type: url
-    url: "https://github.com"
-    group: "示例"

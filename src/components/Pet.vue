@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const props = defineProps<{
-  state: "idle" | "busy" | "success" | "fail" | "sleep";
+  state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth";
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -24,6 +24,7 @@ const stateColors: Record<string, string> = {
   success: "#44bb44",
   fail: "#dd4444",
   sleep: "#8888cc",
+  waiting_auth: "#ddaa00",
 };
 
 function drawCat(ctx: CanvasRenderingContext2D, state: string, frame: number) {
@@ -110,6 +111,13 @@ function drawCat(ctx: CanvasRenderingContext2D, state: string, frame: number) {
     ctx.font = `${8 * s}px monospace`;
     ctx.fillText("z", 52 * s, baseY - 12 * s - zOffset);
   }
+
+  if (state === "waiting_auth") {
+    // Blinking question mark
+    ctx.fillStyle = frame % 4 < 3 ? "#ffdd00" : "#ff8800";
+    ctx.font = `bold ${12 * s}px monospace`;
+    ctx.fillText("?", 48 * s, baseY - 6 * s);
+  }
 }
 
 function drawPixelRect(
@@ -170,6 +178,7 @@ onUnmounted(() => {
     :width="CANVAS_SIZE"
     :height="CANVAS_SIZE"
     class="pet-canvas"
+    :class="{ 'pet-canvas--auth': state === 'waiting_auth' }"
     @mousedown="onMouseDown"
   />
 </template>
@@ -182,6 +191,11 @@ onUnmounted(() => {
   transform: translate(-50%, -50%);
   cursor: grab;
   image-rendering: pixelated;
+  transition: top 0.2s ease;
+}
+
+.pet-canvas--auth {
+  top: 30%;
 }
 
 .pet-canvas:active {

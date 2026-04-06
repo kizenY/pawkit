@@ -1,14 +1,18 @@
 mod config;
 mod executor;
+mod hook_server;
 
 use config::SharedConfig;
 use executor::{execute_action, ActionResult};
+use hook_server::{AuthDecision, PendingRequests};
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
     Emitter, Manager, WebviewWindow,
 };
+
+const HOOK_SERVER_PORT: u16 = 9527;
 
 #[tauri::command]
 fn get_actions(state: tauri::State<SharedConfig>) -> Vec<config::Action> {
@@ -55,6 +59,31 @@ async fn run_action(
     let _ = app.emit("action_finished", &result);
 
     Ok(result)
+}
+
+#[tauri::command]
+async fn respond_auth(
+    request_id: String,
+    allow: bool,
+    pending: tauri::State<'_, PendingRequests>,
+) -> Result<bool, String> {
+    let mut pending = pending.lock().await;
+    if let Some(tx) = pending.remove(&request_id) {
+        let decision = if allow {
+            AuthDecision::Allow
+        } else {
+            AuthDecision::Deny
+        };
+        let _ = tx.send(decision);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+fn get_hook_port() -> u16 {
+    HOOK_SERVER_PORT
 }
 
 #[tauri::command]
@@ -155,6 +184,7 @@ fn build_tray_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let _tray = TrayIconBuilder::new()
+        .icon(tauri::include_image!("icons/32x32.png"))
         .tooltip("Pawkit")
         .menu(&menu)
         .on_menu_event(move |app, event| {
@@ -224,17 +254,21 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
 pub fn run() {
     let initial_config = config::load_all_config();
     let shared_config: SharedConfig = Arc::new(Mutex::new(initial_config));
+    let pending_requests: PendingRequests = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .manage(shared_config.clone())
+        .manage(pending_requests.clone())
         .invoke_handler(tauri::generate_handler![
             get_actions,
             get_pet_config,
             run_action,
             reload_config,
             show_context_menu,
+            respond_auth,
+            get_hook_port,
         ])
         .setup(move |app| {
             // Fix transparent window on Windows - clear both window and webview backgrounds
@@ -251,6 +285,9 @@ pub fn run() {
             build_tray_menu(app)?;
             let app_handle = app.handle().clone();
             start_config_watcher(app_handle.clone(), shared_config.clone());
+
+            // Start the HTTP hook server for Claude Code integration
+            hook_server::start_hook_server(app_handle.clone(), pending_requests.clone(), HOOK_SERVER_PORT);
 
             // Handle native context menu events
             let menu_config = shared_config.clone();

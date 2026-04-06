@@ -24,6 +24,8 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 open = "5"
 dirs = "6"
 chrono = "0.4"
-tokio = { version = "1", features = ["process", "io-util", "rt"] }
+tokio = { version = "1", features = ["process", "io-util", "rt", "rt-multi-thread", "net", "time", "macros"] }
 regex-lite = "0.1"
 window-vibrancy = "0.6"
+axum = "0.8"
+uuid = { version = "1", features = ["v4"] }
