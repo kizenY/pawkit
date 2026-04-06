@@ -52,8 +52,18 @@ type ExecResult = Result<(String, String, Option<i32>), String>;
 fn execute_shell(action: &Action) -> ExecResult {
     let command = action.command.as_deref().ok_or("Missing 'command' field")?;
 
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", command]);
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
 
     if let Some(workdir) = &action.workdir {
         cmd.current_dir(workdir);
@@ -77,8 +87,10 @@ fn execute_script(action: &Action) -> ExecResult {
         ("python", vec![path])
     } else if path.ends_with(".sh") {
         ("bash", vec![path])
-    } else {
+    } else if cfg!(target_os = "windows") {
         ("cmd", vec!["/C", path])
+    } else {
+        ("sh", vec!["-c", path])
     };
 
     let mut cmd = Command::new(program);

@@ -184,8 +184,8 @@ async fn poll_github(
 
     // 1. Check review requests for each repo
     for repo in &config.repos {
-        let output = tokio::process::Command::new("cmd")
-            .args(["/C", "gh", "pr", "list",
+        let output = tokio::process::Command::new("gh")
+            .args(["pr", "list",
                 "--repo", repo,
                 "--search", "review-requested:@me",
                 "--json", "number,title,url",
@@ -225,8 +225,8 @@ async fn poll_github(
     }
 
     // 2. Check notifications for mentions
-    let output = tokio::process::Command::new("cmd")
-        .args(["/C", "gh", "api", "notifications",
+    let output = tokio::process::Command::new("gh")
+        .args(["api", "notifications",
             "--jq", "[.[] | select(.reason == \"mention\") | {id: .id, reason: .reason, title: .subject.title, url: .subject.url, repo: .repository.full_name}]"])
         .output()
         .await
@@ -284,8 +284,8 @@ async fn fetch_latest_mention_comment(repo: &str, pr_number: u64) -> String {
     if pr_number == 0 { return String::new(); }
 
     let endpoint = format!("repos/{}/issues/{}/comments?per_page=5&direction=desc", repo, pr_number);
-    let output = tokio::process::Command::new("cmd")
-        .args(["/C", "gh", "api", &endpoint,
+    let output = tokio::process::Command::new("gh")
+        .args(["api", &endpoint,
             "--jq", ".[0].body // \"\""])
         .output()
         .await;
@@ -316,7 +316,9 @@ async fn process_approved_items(
 
         let working_dir = config.repo_dirs.get(&item.repo)
             .cloned()
-            .unwrap_or_else(|| "E:\\develop\\code".to_string());
+            .unwrap_or_else(|| std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string()));
 
         let prompt = build_review_prompt(&item);
 
@@ -333,8 +335,8 @@ async fn process_approved_items(
                 // Mark notification as read
                 if item.item_type == "mention" {
                     let notif_id = item.id.strip_prefix("mention_").unwrap_or(&item.id);
-                    let _ = tokio::process::Command::new("cmd")
-                        .args(["/C", "gh", "api", "-X", "PATCH",
+                    let _ = tokio::process::Command::new("gh")
+                        .args(["api", "-X", "PATCH",
                             &format!("notifications/threads/{}", notif_id)])
                         .output()
                         .await;
