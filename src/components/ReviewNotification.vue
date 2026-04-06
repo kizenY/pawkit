@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 interface ReviewItem {
   id: string;
@@ -44,6 +45,12 @@ async function approve() {
   // Don't clear processing here — wait for review_item_done/error event
 }
 
+function openPr() {
+  if (!current.value) return;
+  const url = current.value.url || `https://github.com/${current.value.repo}/pull/${current.value.pr_number}`;
+  openUrl(url);
+}
+
 function skip() {
   if (!current.value) return;
   invoke("skip_review_item", { id: current.value.id });
@@ -81,7 +88,7 @@ onUnmounted(() => {
       <div class="review-type">
         {{ current.item_type === "review_request" ? "Review" : "@Mention" }}
       </div>
-      <div class="review-title">
+      <div class="review-title" @mousedown.prevent @click="openPr">
         {{ current.repo.split("/")[1] }}#{{ current.pr_number }}
       </div>
       <div class="review-desc">{{ current.title }}</div>
@@ -122,8 +129,12 @@ onUnmounted(() => {
 .review-title {
   font-weight: 700;
   font-size: 11px;
-  color: #ffffff;
+  color: #6ab0ff;
   margin-bottom: 2px;
+  cursor: pointer;
+}
+.review-title:hover {
+  text-decoration: underline;
 }
 
 .review-desc {
