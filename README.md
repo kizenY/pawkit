@@ -1,123 +1,115 @@
-# Pawkit
+# 🐾 Pawkit
 
-A desktop pet that doubles as a Claude Code companion. The pixel cat sits on your desktop, proxies Claude Code's permission requests, notifies you when tasks complete, and lets you control Claude Code remotely via Slack when you're away from your desk.
+**让 Claude Code 脱离终端束缚，把你的 AI Agent 装进兜里。**
 
-Built with Tauri v2 + Vue 3 + Rust. Windows only (for now).
+[![GitHub stars](https://img.shields.io/github/stars/kizenY/pawkit?style=flat-square)](https://github.com/kizenY/pawkit/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-## Features
+---
 
-### Desktop Pet
-- Transparent, always-on-top, draggable pixel cat
-- Animated states: idle, busy, success, fail, sleep, away
-- Right-click context menu for quick actions
-- System tray integration (show/hide/quit)
-- Sound effects (meow on interaction, bell on task completion)
+## 😫 用的很爽，但也很烦？
 
-### Claude Code Auth Proxy
-Pawkit runs an HTTP hook server on `localhost:9527` that intercepts Claude Code's tool permission requests:
+如果你在使用 Claude Code 或类似的 AI CLI 编程工具，你一定经历过这些痛苦：
 
-- **Safe tools auto-allowed** — Read, Glob, Grep, Agent, WebSearch, etc. pass through silently
-- **Smart Bash analysis** — read-only commands (`ls`, `git status`, `find`) auto-allowed; dangerous commands (`rm`, `git push`, `sudo`) require approval
-- **Visual permission UI** — non-safe tools show an Allow / Allow All / Deny prompt on the cat instead of blocking the terminal
-- **Allow All** — auto-allows that tool type for the rest of the session
+* **"盯盘"焦虑**：明明 AI 在写代码，你却得一直死守在屏幕前，等它弹出一个 `Approve? [y/n]`。
+* **物理束缚**：代码写到一半想出门？对不起，你得守在电脑前。
+* **远程无力**：人在外面，突然想让家里的电脑跑个测试、改个 Bug，终端却不可触达。
 
-### Bell Notifications
-When Claude Code completes a task, the cat gets a bell. Click the cat to dismiss it.
+**Pawkit 就是为了终结这些困扰而生的。**
 
-### Away Mode (Slack Remote Control)
-When you leave your desk, right-click the cat and select "外出模式". Pawkit connects to Slack via Socket Mode and lets you:
+一只桌面小猫 + Claude Code 的远程控制手柄。Built with Tauri v2 + Vue 3 + Rust.
 
-- **Chat with Claude Code** from your phone via Slack DM
-- **Approve/deny** critical tool requests with interactive Slack buttons (updated in-place, no spam)
-- **Resume your terminal session** — Pawkit remembers the last Claude Code session and continues it remotely
-- **Thread-based conversations** — new top-level messages start new sessions, thread replies continue the current one
-- **Built-in commands**: `!ping`, `!cd`, `!stop`, `!auto on/off`
-- **Typing indicator** via Slack's Assistants API while Claude is thinking
+---
 
-Right-click the cat and select "回家了" to return to local mode.
+## 🚀 核心功能
 
-### Quick Actions
-Right-click the cat to trigger configurable actions defined in YAML:
+### 📱 不盯盘的 AI 编程
 
-| Type | Description |
-|------|-------------|
-| `shell` | Run shell commands |
-| `script` | Execute script files (.ps1, .py, .sh) |
-| `url` | Open URLs in default browser |
-| `http` | Send HTTP requests (GET/POST/PUT/DELETE) |
-| `pipeline` | Chain multiple steps sequentially |
+Pawkit 作为 Claude Code 的 Auth Proxy（`localhost:9527`），接管所有工具权限请求：
 
-Actions support grouping, environment variable substitution (`${VAR}`), confirmation dialogs, and hot-reload on config save.
+- **安全工具自动放行** — Read、Glob、Grep 等只读操作静默通过
+- **智能 Bash 分析** — `ls`、`git status` 自动放行；`rm`、`git push`、`sudo` 需要审批
+- **桌面小猫弹窗** — 非安全工具在小猫上弹出 Allow / Allow All / Deny，不再阻塞终端
+- **Allow All** — 一键放行该工具类型的所有后续请求（本次会话内）
 
-### Hot-Reload Configuration
-All YAML config files are watched for changes and reloaded automatically — no restart needed.
+### 🌍 出门也能 Coding
 
-## Quick Start
+右键小猫 →「外出模式」，Pawkit 通过 Slack Socket Mode 连接你的手机：
 
-### Prerequisites
+- **Slack DM 对话** — 在手机上直接和 Claude Code 聊天，发指令
+- **远程审批** — 危险操作通过 Slack 按钮审批（原地更新，不刷屏）
+- **会话继承** — 自动恢复你离开前的终端会话
+- **输出转发** — Claude Code 的任务结果实时推送到 Slack
+- **线程管理** — 新消息开新会话，thread 回复延续当前会话
 
-- [Node.js](https://nodejs.org/) >= 18
-- [pnpm](https://pnpm.io/) >= 8
-- [Rust](https://rustup.rs/) >= 1.70
-- Windows 10/11 with [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
+### 🔔 状态推送
 
-### Install
+AI 完成了长任务，或者卡在了某个权限申请？
 
-Download the latest installer from [Releases](../../releases).
+- **回家模式**：小猫挂上铃铛，点击消除
+- **外出模式**：结果直接推送到 Slack
 
-### Development
+### 🤖 Auto Review
+
+Pawkit 每 5 分钟自动巡查 GitHub：
+
+1. 发现需要你 review 的 PR 或 @mention 你的评论
+2. 小猫弹窗（或 Slack 通知）让你选择 Handle / Skip
+3. 点 Handle → Claude Code 自动读 diff、分析、提交 review
+4. 每个动作（review、comment、merge）都经过 Auth Proxy 等你审批
+
+### ⚡ 自定义快捷操作
+
+右键小猫触发你定义的快捷操作，`config/actions.yaml` 热加载：
+
+```yaml
+actions:
+  # 一键部署
+  - id: deploy-dev
+    name: "Server → Dev"
+    icon: "🚀"
+    type: shell
+    command: "gh workflow run deploy_dev.yml --repo MyOrg/my-repo --ref main"
+    group: "Deploy"
+
+  # 危险操作带确认框
+  - id: deploy-prod
+    name: "Server → Prod"
+    icon: "🔴"
+    type: shell
+    command: "gh workflow run deploy_prod.yml --repo MyOrg/my-repo --ref main -f confirm=deploy-prod"
+    confirm: true
+    group: "Deploy"
+```
+
+支持的 action 类型：`shell`、`script`、`url`、`http`、`pipeline`
+
+---
+
+## 🔧 快速开始
+
+### 安装
+
+从 [Releases](../../releases) 下载最新安装包。
+
+### 开发
 
 ```bash
+git clone https://github.com/kizenY/pawkit.git
+cd pawkit
 pnpm install
 pnpm tauri dev
 ```
 
-### Build
+### 构建
 
 ```bash
 pnpm tauri build
 ```
 
-## Configuration
+### 配置 Claude Code Hook
 
-All config files live in `config/` and are hot-reloaded on save.
-
-### Actions (`config/actions.yaml`)
-
-```yaml
-actions:
-  - id: build
-    name: "Build Project"
-    icon: "🔨"
-    type: shell
-    command: "pnpm build"
-    workdir: "/path/to/project"
-    group: "Dev"
-    confirm: true
-
-  - id: open-docs
-    name: "Open Docs"
-    icon: "📖"
-    type: url
-    url: "https://example.com/docs"
-```
-
-See [docs/CONFIG.md](docs/CONFIG.md) for full reference.
-
-### Pet Appearance (`config/pet.yaml`)
-
-```yaml
-pet:
-  sprite: "pixel-cat"
-  scale: 2
-  idle_timeout: 300
-  start_position: "bottom-right"
-  opacity: 1.0
-```
-
-### Claude Code Hook Setup
-
-Add to `~/.claude/settings.json`:
+将以下内容添加到 `~/.claude/settings.json`：
 
 ```json
 {
@@ -148,7 +140,9 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-### Slack Remote Mode (`config/slack.yaml`)
+### 配置 Slack 远程模式
+
+`config/slack.yaml`：
 
 ```yaml
 bot_token: "xoxb-..."
@@ -159,28 +153,43 @@ critical_tools:
   - Bash
 ```
 
-Required Slack app scopes: `chat:write`, `im:history`, `im:read`, `im:write`, `connections:write`. Add `assistant:write` for typing indicator support.
+所需 Slack App 权限：`chat:write`、`im:history`、`im:read`、`im:write`、`connections:write`。添加 `assistant:write` 以支持输入状态指示。
 
-## Documentation
+### 配置 Auto Review
 
-| File | Description |
-|------|-------------|
-| [CLAUDE.md](CLAUDE.md) | AI agent maintenance guide |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and module design |
-| [docs/CONFIG.md](docs/CONFIG.md) | Configuration file format reference |
-| [docs/ACTIONS.md](docs/ACTIONS.md) | Action types and extension guide |
-| [docs/SPRITES.md](docs/SPRITES.md) | Sprite system and animation state machine |
-| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development environment setup |
+`config/auto_review.yaml`：
 
-## Tech Stack
+```yaml
+enabled: true
+interval_minutes: 5
+repos:
+  - MyOrg/my-repo
+repo_dirs:
+  MyOrg/my-repo: "C:\\projects\\my-repo"
+```
 
-- **Tauri v2** — desktop framework (~5MB bundle)
-- **Vue 3** + TypeScript — frontend
-- **Rust** — backend (action execution, hook server, Slack bridge, window management)
-- **Canvas** — procedural pixel art animation
-- **Axum** — HTTP hook server
-- **Tokio-Tungstenite** — Slack Socket Mode WebSocket
+---
 
-## License
+## 🤝 参与贡献
 
-MIT
+这是一个为了解决"开发者自己的烦恼"而诞生的项目。欢迎加入：
+
+* **提个需求**：开个 Issue 告诉我你最想解决的痛点
+* **修个 Bug**：欢迎直接提 PR
+* **Roadmap**：
+    - [ ] macOS / Linux 支持
+    - [ ] 深度适配更多 CLI Agent (Aider 等)
+    - [ ] 手机端快捷操作面板
+    - [ ] 实时终端日志回溯
+
+---
+
+## ⭐ 别忘了给个 Star！
+
+如果 Pawkit 帮你省下了盯着黑框框的时间，或者让你能安心出门喝杯咖啡，请点个 **Star** 支持一下！
+
+---
+
+## 📄 License
+
+Distributed under the MIT License.

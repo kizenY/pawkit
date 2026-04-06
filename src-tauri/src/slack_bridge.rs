@@ -258,7 +258,8 @@ struct UserMessage {
     thread_ts: Option<String>,
 }
 
-/// Extract user message + thread info from a Socket Mode event
+/// Extract user message + thread info from a Socket Mode event.
+/// Handles both plain text and Slack's rich_text blocks.
 fn extract_user_message(envelope: &serde_json::Value, dm_user_id: &str, dm_channel_id: &str) -> Option<UserMessage> {
     let payload = envelope.get("payload")?;
     let event = payload.get("event")?;
@@ -269,12 +270,116 @@ fn extract_user_message(envelope: &serde_json::Value, dm_user_id: &str, dm_chann
     if event.get("user")?.as_str()? != dm_user_id { return None; }
     if event.get("channel")?.as_str()? != dm_channel_id { return None; }
 
-    let text = event.get("text")?.as_str()?.trim().to_string();
+    // Try `text` field first, then fall back to extracting from rich_text blocks
+    let mut text = event.get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    // If text is empty or suspiciously short, try extracting from blocks
+    if text.is_empty() {
+        if let Some(blocks_text) = extract_text_from_blocks(event) {
+            text = blocks_text;
+        }
+    }
+
     if text.is_empty() { return None; }
 
     let thread_ts = event.get("thread_ts").and_then(|v| v.as_str()).map(String::from);
 
     Some(UserMessage { text, thread_ts })
+}
+
+/// Extract plain text from Slack's rich_text blocks.
+/// Handles the new Slack editor's block format where content is in
+/// blocks[].elements[].elements[].text instead of the top-level text field.
+fn extract_text_from_blocks(event: &serde_json::Value) -> Option<String> {
+    let blocks = event.get("blocks")?.as_array()?;
+    let mut parts: Vec<String> = Vec::new();
+
+    for block in blocks {
+        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match block_type {
+            "rich_text" => {
+                if let Some(elements) = block.get("elements").and_then(|v| v.as_array()) {
+                    for section in elements {
+                        let section_type = section.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match section_type {
+                            "rich_text_section" | "rich_text_preformatted" | "rich_text_quote" => {
+                                if let Some(inners) = section.get("elements").and_then(|v| v.as_array()) {
+                                    for elem in inners {
+                                        let elem_type = elem.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                        match elem_type {
+                                            "text" => {
+                                                if let Some(t) = elem.get("text").and_then(|v| v.as_str()) {
+                                                    parts.push(t.to_string());
+                                                }
+                                            }
+                                            "emoji" => {
+                                                // Convert Slack emoji to :name: format
+                                                if let Some(name) = elem.get("name").and_then(|v| v.as_str()) {
+                                                    parts.push(format!(":{}:", name));
+                                                }
+                                            }
+                                            "link" => {
+                                                let url = elem.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                                let text = elem.get("text").and_then(|v| v.as_str()).unwrap_or(url);
+                                                parts.push(text.to_string());
+                                            }
+                                            "user" | "usergroup" | "channel" => {
+                                                if let Some(id) = elem.get("user_id")
+                                                    .or_else(|| elem.get("usergroup_id"))
+                                                    .or_else(|| elem.get("channel_id"))
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    parts.push(format!("@{}", id));
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                // Add newline between sections
+                                if section_type == "rich_text_preformatted" {
+                                    // Wrap code blocks
+                                    let last = parts.pop().unwrap_or_default();
+                                    parts.push(format!("```\n{}\n```", last));
+                                }
+                            }
+                            "rich_text_list" => {
+                                if let Some(items) = section.get("elements").and_then(|v| v.as_array()) {
+                                    for item in items {
+                                        if let Some(inners) = item.get("elements").and_then(|v| v.as_array()) {
+                                            let mut item_text = String::new();
+                                            for elem in inners {
+                                                if let Some(t) = elem.get("text").and_then(|v| v.as_str()) {
+                                                    item_text.push_str(t);
+                                                }
+                                            }
+                                            parts.push(format!("- {}", item_text));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        parts.push("\n".to_string());
+                    }
+                }
+            }
+            "section" => {
+                if let Some(text) = block.get("text").and_then(|t| t.get("text")).and_then(|v| v.as_str()) {
+                    parts.push(text.to_string());
+                    parts.push("\n".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let result = parts.join("").trim().to_string();
+    if result.is_empty() { None } else { Some(result) }
 }
 
 struct ButtonAction {
@@ -475,7 +580,8 @@ pub async fn run_remote_session(
                     None => continue,
                 };
 
-                println!("[Pawkit] Message: thread={:?} text={}", user_msg.thread_ts, &user_msg.text[..user_msg.text.len().min(60)]);
+                let preview: String = user_msg.text.chars().take(60).collect();
+                println!("[Pawkit] Message: thread={:?} text={}", user_msg.thread_ts, preview);
 
                 let lower = user_msg.text.to_lowercase();
                 let active_thread = ws_slack.get_active_thread().await;
@@ -608,6 +714,7 @@ pub async fn run_remote_session(
         }
     });
 
-    let _ = tokio::join!(listener, processor);
+    let (listener_res, processor_res) = tokio::join!(listener, processor);
+    println!("[Pawkit] Remote session ended. listener={:?} processor={:?}", listener_res, processor_res);
     let _ = slack.reply("🐱 *Pawkit 远程模式已关闭，回家啦~*").await;
 }
