@@ -1,4 +1,5 @@
 mod auto_review;
+pub mod cli;
 mod config;
 mod executor;
 mod hook_server;
@@ -260,17 +261,80 @@ async fn show_context_menu(
 
 fn build_tray_menu(
     app: &tauri::App,
+    shared_config: &SharedConfig,
+    is_away: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let show = MenuItemBuilder::with_id("show", "Show Pawkit").build(app)?;
-    let hide = MenuItemBuilder::with_id("hide", "Hide Pawkit").build(app)?;
-    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let (actions, show_pet) = {
+        let cfg = shared_config.lock().unwrap();
+        (cfg.actions.actions.clone(), cfg.pet.show_pet)
+    };
+    let is_away_val = is_away.load(Ordering::SeqCst);
 
-    let menu = MenuBuilder::new(app)
-        .item(&show)
-        .item(&hide)
-        .separator()
-        .item(&quit)
-        .build()?;
+    let mut menu_builder = MenuBuilder::new(app);
+
+    // Away/Home toggle
+    if is_away_val {
+        let home_item = MenuItemBuilder::with_id("_pawkit_home", "🏠 回家了").build(app)?;
+        menu_builder = menu_builder.item(&home_item);
+    } else {
+        let away_item = MenuItemBuilder::with_id("_pawkit_away", "🏖 外出模式").build(app)?;
+        menu_builder = menu_builder.item(&away_item);
+    }
+    menu_builder = menu_builder.separator();
+
+    // Actions
+    let mut groups: std::collections::BTreeMap<String, Vec<&config::Action>> = std::collections::BTreeMap::new();
+    let mut ungrouped: Vec<&config::Action> = Vec::new();
+
+    for action in &actions {
+        if !action.enabled {
+            continue;
+        }
+        if let Some(ref group) = action.group {
+            groups.entry(group.clone()).or_default().push(action);
+        } else {
+            ungrouped.push(action);
+        }
+    }
+
+    for action in &ungrouped {
+        let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
+        let item = MenuItemBuilder::with_id(&action.id, label).build(app)?;
+        menu_builder = menu_builder.item(&item);
+    }
+
+    for (group_name, group_actions) in &groups {
+        if !ungrouped.is_empty() || groups.len() > 1 {
+            menu_builder = menu_builder.separator();
+        }
+        let group_label = MenuItemBuilder::with_id(
+            format!("_group_{}", group_name),
+            format!("  {}  ", group_name),
+        )
+        .enabled(false)
+        .build(app)?;
+        menu_builder = menu_builder.item(&group_label);
+
+        for action in group_actions {
+            let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
+            let item = MenuItemBuilder::with_id(&action.id, label).build(app)?;
+            menu_builder = menu_builder.item(&item);
+        }
+    }
+
+    menu_builder = menu_builder.separator();
+
+    // Show/Hide pet (only when show_pet is true)
+    if show_pet {
+        let show = MenuItemBuilder::with_id("show", "Show Pawkit").build(app)?;
+        let hide = MenuItemBuilder::with_id("hide", "Hide Pawkit").build(app)?;
+        menu_builder = menu_builder.item(&show).item(&hide).separator();
+    }
+
+    let quit = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit").build(app)?;
+    menu_builder = menu_builder.item(&quit);
+
+    let menu = menu_builder.build()?;
 
     let _tray = TrayIconBuilder::new()
         .icon(tauri::include_image!("icons/32x32.png"))
@@ -288,9 +352,6 @@ fn build_tray_menu(
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.hide();
                     }
-                }
-                "quit" => {
-                    app.exit(0);
                 }
                 _ => {}
             }
@@ -328,9 +389,18 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
                 while rx.try_recv().is_ok() {}
 
                 let new_config = config::load_all_config();
+                let show_pet = new_config.pet.show_pet;
                 {
                     let mut config = shared_config.lock().unwrap();
                     *config = new_config;
+                }
+                // Show or hide pet window based on updated config
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    if show_pet {
+                        let _ = window.show();
+                    } else {
+                        let _ = window.hide();
+                    }
                 }
                 let _ = app_handle.emit("config_changed", ());
                 println!("[Pawkit] Config reloaded");
@@ -421,7 +491,15 @@ pub fn run() {
                 }
             }
 
-            build_tray_menu(app)?;
+            build_tray_menu(app, &shared_config, &is_away)?;
+
+            // Hide pet window if show_pet is false (tray-only mode)
+            {
+                let cfg = shared_config.lock().unwrap();
+                if !cfg.pet.show_pet {
+                    let _ = window.hide();
+                }
+            }
 
             let app_handle = app.handle().clone();
             start_config_watcher(app_handle.clone(), shared_config.clone());

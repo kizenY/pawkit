@@ -90,6 +90,18 @@ actions:
 
 Supported action types: `shell`, `script`, `url`, `http`, `pipeline`
 
+### 🖥️ CLI Mode
+
+Prefer the terminal over a desktop pet? Run actions directly from the command line — no GUI needed:
+
+```bash
+pawkit list                      # Show all actions
+pawkit run deploy-dev            # Execute an action
+pawkit run deploy-prod -y        # Skip confirmation
+```
+
+Same config, same execution engine. Composable in shell scripts and aliases.
+
 ---
 
 ## 🔧 Getting Started

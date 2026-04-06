@@ -83,6 +83,26 @@ cd src-tauri && cargo test
 pnpm vue-tsc --noEmit
 ```
 
+## CLI Mode
+
+The same binary supports headless CLI usage via `clap` subcommands:
+
+```bash
+# List available actions
+cargo run -- list
+
+# Run an action (no GUI launched)
+cargo run -- run deploy-dev
+
+# Skip confirmation
+cargo run -- run deploy-prod -y
+
+# No subcommand → launches GUI as normal
+cargo run
+```
+
+This is useful for scripting, shell aliases, or users who prefer not to use the desktop pet.
+
 ## File Watcher Behavior
 
 The config module watches `config/actions.yaml` and `config/pet.yaml`:

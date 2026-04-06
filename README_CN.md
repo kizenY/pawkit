@@ -92,6 +92,18 @@ actions:
 
 支持的 action 类型：`shell`、`script`、`url`、`http`、`pipeline`
 
+### 🖥️ CLI 模式
+
+不想养桌面宠物？直接在终端里跑 action，不启动 GUI：
+
+```bash
+pawkit list                      # 列出所有 action
+pawkit run deploy-dev            # 执行 action
+pawkit run deploy-prod -y        # 跳过确认
+```
+
+共享同一份配置、同一套执行引擎，可组合进 shell 脚本和 alias。
+
 ---
 
 ## 🔧 快速开始

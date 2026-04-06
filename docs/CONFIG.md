@@ -120,9 +120,10 @@ actions:
 ### Rules
 - `id` must be unique across all actions
 - `id` must be lowercase kebab-case: `[a-z0-9]+(-[a-z0-9]+)*`
-- `group` is used to organize the right-click menu into submenus
+- `group` is used to organize the right-click menu into submenus (GUI) and filter output (CLI `pawkit list -g`)
 - Actions without a `group` appear at the top level of the menu
 - Actions are displayed in the order they appear in the file
+- `id` is used as the CLI identifier: `pawkit run <id>`
 
 ---
 

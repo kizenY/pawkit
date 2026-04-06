@@ -105,6 +105,30 @@ Executes multiple steps sequentially. Each step is a `shell`, `http`, or `url` a
 - `on_failure: continue` — runs all steps, reports failures at the end
 - Each step's output is logged separately
 
+## CLI Usage
+
+Actions can be executed directly from the terminal without launching the GUI:
+
+```bash
+# List all actions
+pawkit list
+
+# List actions in a specific group
+pawkit list -g "Deploy"
+
+# Run an action
+pawkit run deploy-dev
+
+# Run with confirmation skipped
+pawkit run deploy-prod -y
+```
+
+The CLI uses the same `config.rs` loader and `executor.rs` engine as the GUI, so behavior is identical. The exit code matches the action's exit code, making it composable in shell scripts:
+
+```bash
+pawkit run build && pawkit run deploy-staging
+```
+
 ## Environment Variable Substitution
 
 All string fields support `${ENV_VAR}` syntax:
