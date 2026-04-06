@@ -18,6 +18,8 @@ let unlistenAuth: UnlistenFn | null = null;
 let unlistenMode: UnlistenFn | null = null;
 let unlistenTaskDone: UnlistenFn | null = null;
 let unlistenTerminalFocused: UnlistenFn | null = null;
+let unlistenClaudeActive: UnlistenFn | null = null;
+let claudeIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Pre-create Audio objects to avoid autoplay policy issues.
 // Webview may block new Audio().play() from non-user-interaction contexts.
@@ -94,12 +96,31 @@ onMounted(async () => {
   // Claude Code task completed — show bell as unread indicator (skip in away mode)
   unlistenTaskDone = await listen("claude_task_done", () => {
     if (isAway.value) return;
+    // Clear busy state
+    if (claudeIdleTimer) clearTimeout(claudeIdleTimer);
+    if (petState.value === "busy") {
+      petState.value = "idle";
+    }
     hasUnread.value = true;
     playBell();
   });
   // User switched to Claude terminal directly — clear unread
   unlistenTerminalFocused = await listen("terminal_focused", () => {
     hasUnread.value = false;
+  });
+  // Claude Code is actively working (PreToolUse hook fired) — show busy
+  unlistenClaudeActive = await listen("claude_active", () => {
+    if (isAway.value) return;
+    if (petState.value !== "waiting_auth") {
+      petState.value = "busy";
+    }
+    // Reset idle timer — go back to idle after 15s of no activity
+    if (claudeIdleTimer) clearTimeout(claudeIdleTimer);
+    claudeIdleTimer = setTimeout(() => {
+      if (petState.value === "busy") {
+        petState.value = "idle";
+      }
+    }, 15000);
   });
 });
 
@@ -110,6 +131,7 @@ onUnmounted(() => {
   unlistenMode?.();
   unlistenTaskDone?.();
   unlistenTerminalFocused?.();
+  unlistenClaudeActive?.();
 });
 </script>
 

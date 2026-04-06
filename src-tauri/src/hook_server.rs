@@ -284,6 +284,9 @@ async fn handle_pre_tool_use(
 ) -> (StatusCode, Json<HookResponse>) {
     let tool_name = input.tool_name.clone().unwrap_or_else(|| "Unknown".into());
 
+    // Signal that Claude Code is actively working
+    let _ = state.app_handle.emit("claude_active", ());
+
     // Capture session ID only when NOT in away mode — this ensures we only
     // track terminal sessions, not Pawkit's own `claude -p` sessions from Slack.
     if let Some(ref sid) = input.session_id {
@@ -397,6 +400,14 @@ async fn handle_pre_tool_use(
     make_decision_response(decision)
 }
 
+/// Handle UserPromptSubmit — user just pressed enter, Claude starts thinking
+async fn handle_user_prompt(
+    State(state): State<AppState>,
+) -> StatusCode {
+    let _ = state.app_handle.emit("claude_active", ());
+    StatusCode::OK
+}
+
 /// Start the HTTP hook server on the given port
 pub fn start_hook_server(
     app_handle: tauri::AppHandle,
@@ -423,6 +434,7 @@ pub fn start_hook_server(
     let app = Router::new()
         .route("/hook/pre-tool-use", post(handle_pre_tool_use))
         .route("/hook/notification", post(handle_notification))
+        .route("/hook/user-prompt", post(handle_user_prompt))
         .with_state(state);
 
     tauri::async_runtime::spawn(async move {

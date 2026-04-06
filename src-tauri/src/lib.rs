@@ -404,6 +404,21 @@ pub fn run() {
                 let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
                 // Clear the webview background via window-vibrancy
                 let _ = window_vibrancy::clear_blur(&window);
+
+                // Set WS_EX_NOACTIVATE so clicking the pet doesn't steal focus
+                // from fullscreen apps (e.g. video players). The window stays
+                // always-on-top but never becomes the foreground window on click.
+                unsafe {
+                    let hwnd = window.hwnd().unwrap().0 as isize;
+                    const GWL_EXSTYLE: i32 = -20;
+                    const WS_EX_NOACTIVATE: isize = 0x08000000;
+                    extern "system" {
+                        fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+                        fn SetWindowLongPtrW(hwnd: isize, index: i32, new_long: isize) -> isize;
+                    }
+                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE);
+                }
             }
 
             build_tray_menu(app)?;
