@@ -1,10 +1,15 @@
 mod config;
 mod executor;
 mod hook_server;
+mod claude_session;
+mod slack_bridge;
+mod win_focus;
 
 use config::SharedConfig;
 use executor::{execute_action, ActionResult};
-use hook_server::{AuthDecision, PendingRequests};
+use hook_server::{AuthDecision, LastTerminalSession, PendingRequests};
+use slack_bridge::SlackBridge;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
@@ -84,6 +89,11 @@ async fn respond_auth(
 #[tauri::command]
 fn get_hook_port() -> u16 {
     HOOK_SERVER_PORT
+}
+
+#[tauri::command]
+fn focus_claude_terminal() -> bool {
+    win_focus::focus_claude_window()
 }
 
 #[tauri::command]
@@ -171,14 +181,26 @@ async fn show_context_menu(
     Ok(())
 }
 
-fn build_tray_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+fn build_tray_menu(
+    app: &tauri::App,
+    is_away: Arc<AtomicBool>,
+    pending: PendingRequests,
+    slack: Option<Arc<SlackBridge>>,
+    auto_approve: Arc<AtomicBool>,
+    last_terminal_session: LastTerminalSession,
+) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItemBuilder::with_id("show", "Show Pawkit").build(app)?;
     let hide = MenuItemBuilder::with_id("hide", "Hide Pawkit").build(app)?;
+    let away = MenuItemBuilder::with_id("away", "🏖 外出模式").build(app)?;
+    let home = MenuItemBuilder::with_id("home", "🏠 回家了").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&show)
         .item(&hide)
+        .separator()
+        .item(&away)
+        .item(&home)
         .separator()
         .item(&quit)
         .build()?;
@@ -199,6 +221,53 @@ fn build_tray_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.hide();
                     }
+                }
+                "away" => {
+                    if is_away.load(Ordering::SeqCst) {
+                        return; // Already in away mode
+                    }
+
+                    // Load slack config
+                    let config_dir = config::get_config_dir();
+                    let slack_config = config::load_slack_config(&config_dir);
+
+                    if slack_config.bot_token.is_empty() || slack_config.dm_user_id.is_empty() {
+                        eprintln!("[Pawkit] Slack 未配置 bot_token 或 dm_user_id，无法进入外出模式");
+                        return;
+                    }
+
+                    is_away.store(true, Ordering::SeqCst);
+
+                    let away_flag = is_away.clone();
+                    let pending_clone = pending.clone();
+                    let slack_clone = slack.clone();
+
+                    let session_id_clone = last_terminal_session.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(slack) = slack_clone {
+                            let initial_session = session_id_clone.lock().await.clone();
+                            slack_bridge::run_remote_session(
+                                slack,
+                                pending_clone,
+                                away_flag,
+                                slack_config,
+                                initial_session,
+                            )
+                            .await;
+                        }
+                    });
+
+                    let _ = app.emit("mode_changed", "away");
+                    println!("[Pawkit] 已切换到外出模式");
+                }
+                "home" => {
+                    if !is_away.load(Ordering::SeqCst) {
+                        return; // Already home
+                    }
+                    is_away.store(false, Ordering::SeqCst);
+                    auto_approve.store(false, Ordering::SeqCst);
+                    let _ = app.emit("mode_changed", "home");
+                    println!("[Pawkit] 已切换到回家模式");
                 }
                 "quit" => {
                     app.exit(0);
@@ -254,7 +323,29 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
 pub fn run() {
     let initial_config = config::load_all_config();
     let shared_config: SharedConfig = Arc::new(Mutex::new(initial_config));
-    let pending_requests: PendingRequests = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let pending_requests: PendingRequests =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Shared mode state
+    let is_away = Arc::new(AtomicBool::new(false));
+    let auto_approve = Arc::new(AtomicBool::new(false));
+    let last_terminal_session: LastTerminalSession = Arc::new(tokio::sync::Mutex::new(
+        hook_server::load_last_terminal_session(),
+    ));
+
+    // Load Slack config and create bridge (if configured)
+    let config_dir = config::get_config_dir();
+    let slack_config = config::load_slack_config(&config_dir);
+    let slack_bridge: Option<Arc<SlackBridge>> =
+        if !slack_config.bot_token.is_empty() && !slack_config.dm_user_id.is_empty() {
+            Some(Arc::new(SlackBridge::new(
+                slack_config.bot_token.clone(),
+                slack_config.app_token.clone(),
+                slack_config.dm_user_id.clone(),
+            )))
+        } else {
+            None
+        };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -269,6 +360,7 @@ pub fn run() {
             show_context_menu,
             respond_auth,
             get_hook_port,
+            focus_claude_terminal,
         ])
         .setup(move |app| {
             // Fix transparent window on Windows - clear both window and webview backgrounds
@@ -282,12 +374,43 @@ pub fn run() {
                 let _ = window_vibrancy::clear_blur(&window);
             }
 
-            build_tray_menu(app)?;
+            build_tray_menu(
+                app,
+                is_away.clone(),
+                pending_requests.clone(),
+                slack_bridge.clone(),
+                auto_approve.clone(),
+                last_terminal_session.clone(),
+            )?;
+
             let app_handle = app.handle().clone();
             start_config_watcher(app_handle.clone(), shared_config.clone());
 
-            // Start the HTTP hook server for Claude Code integration
-            hook_server::start_hook_server(app_handle.clone(), pending_requests.clone(), HOOK_SERVER_PORT);
+            // Start the HTTP hook server with away-mode support
+            hook_server::start_hook_server(
+                app_handle.clone(),
+                pending_requests.clone(),
+                HOOK_SERVER_PORT,
+                is_away.clone(),
+                slack_bridge.clone(),
+                auto_approve.clone(),
+                slack_config.critical_tools.clone(),
+                last_terminal_session.clone(),
+            );
+
+            // Poll foreground window to detect when user switches to Claude terminal
+            let focus_handle = app_handle.clone();
+            std::thread::spawn(move || {
+                let mut was_focused = false;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let is_focused = win_focus::is_claude_window_focused();
+                    if is_focused && !was_focused {
+                        let _ = focus_handle.emit("terminal_focused", ());
+                    }
+                    was_focused = is_focused;
+                }
+            });
 
             // Handle native context menu events
             let menu_config = shared_config.clone();

@@ -3,7 +3,8 @@ import { ref, onMounted, onUnmounted, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const props = defineProps<{
-  state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth";
+  state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away";
+  showBell?: boolean;
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -25,6 +26,7 @@ const stateColors: Record<string, string> = {
   fail: "#dd4444",
   sleep: "#8888cc",
   waiting_auth: "#ddaa00",
+  away: "#8888cc",
 };
 
 function drawCat(ctx: CanvasRenderingContext2D, state: string, frame: number) {
@@ -35,7 +37,8 @@ function drawCat(ctx: CanvasRenderingContext2D, state: string, frame: number) {
   const color = stateColors[state] || stateColors.idle;
 
   // Body bounce for animation
-  const bounce = state === "sleep" ? 0 : Math.sin(frame * 0.5) * s;
+  const isStill = state === "sleep" || state === "away";
+  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
   const baseY = 30 * s + bounce;
 
   ctx.fillStyle = color;
@@ -62,7 +65,7 @@ function drawCat(ctx: CanvasRenderingContext2D, state: string, frame: number) {
 
   // Eyes
   ctx.fillStyle = "#ffffff";
-  if (state === "sleep") {
+  if (state === "sleep" || state === "away") {
     // Closed eyes (lines)
     ctx.fillStyle = "#333333";
     drawPixelRect(ctx, 22 * s, baseY - 2 * s, 6 * s, 2 * s);
@@ -112,12 +115,89 @@ function drawCat(ctx: CanvasRenderingContext2D, state: string, frame: number) {
     ctx.fillText("z", 52 * s, baseY - 12 * s - zOffset);
   }
 
+  if (state === "away") {
+    // Hanging signboard from cat's neck
+    // String from neck
+    ctx.fillStyle = "#996633";
+    drawPixelRect(ctx, 30 * s, baseY + 12 * s, 2 * s, 10 * s);
+
+    // Signboard background
+    const signX = 16 * s;
+    const signY = baseY + 22 * s;
+    const signW = 30 * s;
+    const signH = 16 * s;
+
+    // Board shadow
+    ctx.fillStyle = "#7a5522";
+    drawPixelRect(ctx, signX + 1 * s, signY + 1 * s, signW, signH);
+
+    // Board
+    ctx.fillStyle = "#c8946a";
+    drawPixelRect(ctx, signX, signY, signW, signH);
+
+    // Board border
+    ctx.fillStyle = "#996633";
+    drawPixelRect(ctx, signX, signY, signW, 2 * s); // top
+    drawPixelRect(ctx, signX, signY + signH - 2 * s, signW, 2 * s); // bottom
+    drawPixelRect(ctx, signX, signY, 2 * s, signH); // left
+    drawPixelRect(ctx, signX + signW - 2 * s, signY, 2 * s, signH); // right
+
+    // Text "外出" on the sign
+    ctx.fillStyle = "#3d2200";
+    ctx.font = `bold ${6 * s}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("外出", signX + signW / 2, signY + signH / 2 + 1 * s);
+    ctx.textAlign = "start";
+    ctx.textBaseline = "alphabetic";
+
+    // Small swing animation on the string
+    const swing = Math.sin(frame * 0.3) * 1 * s;
+    ctx.fillStyle = "#996633";
+    drawPixelRect(ctx, 30 * s + swing, baseY + 18 * s, 2 * s, 4 * s);
+  }
+
   if (state === "waiting_auth") {
     // Blinking question mark
     ctx.fillStyle = frame % 4 < 3 ? "#ffdd00" : "#ff8800";
     ctx.font = `bold ${12 * s}px monospace`;
     ctx.fillText("?", 48 * s, baseY - 6 * s);
   }
+}
+
+function drawBell(ctx: CanvasRenderingContext2D, state: string, frame: number) {
+  const s = SCALE;
+  const isStill = state === "sleep" || state === "away";
+  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
+  const baseY = 30 * s + bounce;
+
+  // Bell hangs from cat's neck, slightly to the right
+  const bellX = 32 * s;
+  const bellY = baseY + 10 * s;
+
+  // Gentle swing
+  const swing = Math.sin(frame * 0.6) * 1.5 * s;
+
+  // String
+  ctx.fillStyle = "#aa8833";
+  drawPixelRect(ctx, bellX + swing * 0.5, bellY, 1 * s, 4 * s);
+
+  // Bell body (golden)
+  ctx.fillStyle = "#ffcc00";
+  drawPixelRect(ctx, bellX - 3 * s + swing, bellY + 4 * s, 7 * s, 5 * s);
+  drawPixelRect(ctx, bellX - 2 * s + swing, bellY + 3 * s, 5 * s, 2 * s);
+
+  // Bell rim (darker gold)
+  ctx.fillStyle = "#dd9900";
+  drawPixelRect(ctx, bellX - 3 * s + swing, bellY + 8 * s, 7 * s, 2 * s);
+
+  // Bell clapper (dark dot)
+  ctx.fillStyle = "#885500";
+  drawPixelRect(ctx, bellX + swing, bellY + 9 * s, 1 * s, 2 * s);
+
+  // Highlight (shine)
+  ctx.fillStyle = "#ffee88";
+  drawPixelRect(ctx, bellX - 1 * s + swing, bellY + 5 * s, 2 * s, 2 * s);
 }
 
 function drawPixelRect(
@@ -142,6 +222,9 @@ function animate() {
   }
 
   drawCat(ctx, props.state, animFrame);
+  if (props.showBell) {
+    drawBell(ctx, props.state, animFrame);
+  }
   animTimer = requestAnimationFrame(animate);
 }
 

@@ -107,6 +107,28 @@ fn default_opacity() -> f64 { 1.0 }
 
 pub type SharedConfig = Arc<Mutex<AppConfig>>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlackConfig {
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub app_token: String,
+    #[serde(default)]
+    pub dm_user_id: String,
+    #[serde(default = "default_working_dir")]
+    pub working_dir: String,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_output_buffer")]
+    pub output_buffer_ms: u64,
+    #[serde(default)]
+    pub critical_tools: Vec<String>,
+}
+
+fn default_working_dir() -> String { "E:\\develop\\code".to_string() }
+fn default_poll_interval() -> u64 { 2000 }
+fn default_output_buffer() -> u64 { 1000 }
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub actions: ActionsConfig,
@@ -192,6 +214,36 @@ fn default_pet_config() -> PetConfig {
         start_position: default_start_position(),
         opacity: default_opacity(),
         click_through: false,
+    }
+}
+
+pub fn load_slack_config(config_dir: &PathBuf) -> SlackConfig {
+    let path = config_dir.join("slack.yaml");
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            match serde_yaml::from_str::<SlackConfig>(&content) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("Failed to parse slack.yaml: {}", e);
+                    SlackConfig::default()
+                }
+            }
+        }
+        Err(_) => SlackConfig::default(),
+    }
+}
+
+impl Default for SlackConfig {
+    fn default() -> Self {
+        Self {
+            bot_token: String::new(),
+            app_token: String::new(),
+            dm_user_id: String::new(),
+            working_dir: default_working_dir(),
+            poll_interval_ms: default_poll_interval(),
+            output_buffer_ms: default_output_buffer(),
+            critical_tools: vec!["Bash".to_string()],
+        }
     }
 }
 

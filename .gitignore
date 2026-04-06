@@ -16,3 +16,7 @@ Thumbs.db
 
 # Temp
 .pnpmrc.json
+
+# Slack tokens (sensitive)
+config/slack.yaml
+config/.last_terminal_session.json
