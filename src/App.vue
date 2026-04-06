@@ -12,6 +12,7 @@ const petState = ref<"idle" | "busy" | "success" | "fail" | "sleep" | "waiting_a
 const authActive = ref(false);
 const isAway = ref(false);
 const hasUnread = ref(false);
+const reviewBubble = ref<"reviewing" | "done" | null>(null);
 let unlistenStarted: UnlistenFn | null = null;
 let unlistenFinished: UnlistenFn | null = null;
 let unlistenAuth: UnlistenFn | null = null;
@@ -80,6 +81,8 @@ onMounted(async () => {
   unlistenAuth = await listen("claude_auth_request", () => {
     if (!isAway.value) {
       playMeow();
+      // New state clears the review "done" lightbulb
+      if (reviewBubble.value === "done") reviewBubble.value = null;
     }
   });
   // Mode change: away / home
@@ -101,6 +104,8 @@ onMounted(async () => {
     if (petState.value === "busy") {
       petState.value = "idle";
     }
+    // New state clears the review "done" lightbulb
+    if (reviewBubble.value === "done") reviewBubble.value = null;
     hasUnread.value = true;
     playBell();
   });
@@ -137,9 +142,9 @@ onUnmounted(() => {
 
 <template>
   <div class="app" @contextmenu="onContextMenu" @click="onClick">
-    <Pet :state="petState" :show-bell="hasUnread" />
+    <Pet :state="petState" :show-bell="hasUnread" :review-bubble="reviewBubble" />
     <AuthNotification v-if="!isAway" @auth-active="onAuthActive" />
-    <ReviewNotification v-if="!isAway && !authActive" />
+    <ReviewNotification v-if="!isAway && !authActive" @review-bubble="(s: any) => reviewBubble = s" />
   </div>
 </template>
 

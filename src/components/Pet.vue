@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 const props = defineProps<{
   state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away";
   showBell?: boolean;
+  reviewBubble?: "reviewing" | "done" | null;
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -200,6 +201,63 @@ function drawBell(ctx: CanvasRenderingContext2D, state: string, frame: number) {
   drawPixelRect(ctx, bellX - 1 * s + swing, bellY + 5 * s, 2 * s, 2 * s);
 }
 
+function drawReviewBubble(ctx: CanvasRenderingContext2D, state: string, frame: number) {
+  const s = SCALE;
+  const isStill = state === "sleep" || state === "away";
+  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
+
+  // Bubble position: right side of cat head
+  const bx = 52 * s;
+  const by = 14 * s + bounce;
+
+  // Speech bubble background
+  ctx.fillStyle = "rgba(50, 50, 70, 0.9)";
+  drawPixelRect(ctx, bx, by, 22 * s, 12 * s);
+  drawPixelRect(ctx, bx + 2 * s, by - 1 * s, 18 * s, 14 * s);
+  // Bubble tail (pointing left toward cat)
+  drawPixelRect(ctx, bx - 2 * s, by + 4 * s, 3 * s, 3 * s);
+
+  // Animated dots "..."
+  const dotCount = (frame % 12);
+  ctx.fillStyle = "#88bbff";
+  for (let i = 0; i < 3; i++) {
+    if (dotCount >= i * 3) {
+      const alpha = dotCount >= (i + 1) * 3 ? 1.0 : 0.5;
+      ctx.globalAlpha = alpha;
+      drawPixelRect(ctx, bx + (5 + i * 5) * s, by + 4 * s, 3 * s, 3 * s);
+    }
+  }
+  ctx.globalAlpha = 1.0;
+}
+
+function drawLightBulb(ctx: CanvasRenderingContext2D, state: string, frame: number) {
+  const s = SCALE;
+  const isStill = state === "sleep" || state === "away";
+  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
+
+  // Bulb position: right side of cat head
+  const bx = 54 * s;
+  const by = 10 * s + bounce;
+
+  // Glow pulse
+  const glow = 0.3 + Math.sin(frame * 0.4) * 0.15;
+  ctx.fillStyle = `rgba(255, 230, 100, ${glow})`;
+  drawPixelRect(ctx, bx - 3 * s, by - 3 * s, 14 * s, 14 * s);
+
+  // Bulb body (yellow)
+  ctx.fillStyle = "#ffdd44";
+  drawPixelRect(ctx, bx, by, 8 * s, 8 * s);
+  drawPixelRect(ctx, bx + 1 * s, by - 1 * s, 6 * s, 1 * s);
+
+  // Bulb base (gray)
+  ctx.fillStyle = "#999999";
+  drawPixelRect(ctx, bx + 2 * s, by + 8 * s, 4 * s, 3 * s);
+
+  // Filament highlight
+  ctx.fillStyle = "#ffffff";
+  drawPixelRect(ctx, bx + 3 * s, by + 2 * s, 2 * s, 3 * s);
+}
+
 function drawPixelRect(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -224,6 +282,11 @@ function animate() {
   drawCat(ctx, props.state, animFrame);
   if (props.showBell) {
     drawBell(ctx, props.state, animFrame);
+  }
+  if (props.reviewBubble === "reviewing") {
+    drawReviewBubble(ctx, props.state, animFrame);
+  } else if (props.reviewBubble === "done") {
+    drawLightBulb(ctx, props.state, animFrame);
   }
   animTimer = requestAnimationFrame(animate);
 }

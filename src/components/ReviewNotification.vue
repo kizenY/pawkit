@@ -22,6 +22,7 @@ let unlistenError: UnlistenFn | null = null;
 
 const emit = defineEmits<{
   reviewActive: [active: boolean];
+  reviewBubble: [state: "reviewing" | "done" | null];
 }>();
 
 function processQueue() {
@@ -37,10 +38,10 @@ function processQueue() {
 async function approve() {
   if (!current.value) return;
   processing.value = true;
+  emit("reviewBubble", "reviewing");
   await invoke("approve_review_item", { id: current.value.id });
   current.value = null;
-  processing.value = false;
-  processQueue();
+  // Don't clear processing here — wait for review_item_done/error event
 }
 
 function skip() {
@@ -57,10 +58,12 @@ onMounted(async () => {
   });
   unlistenDone = await listen<string>("review_item_done", () => {
     processing.value = false;
+    emit("reviewBubble", "done");
     processQueue();
   });
   unlistenError = await listen("review_item_error", () => {
     processing.value = false;
+    emit("reviewBubble", "done");
     processQueue();
   });
 });

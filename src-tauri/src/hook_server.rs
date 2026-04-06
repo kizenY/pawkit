@@ -408,6 +408,18 @@ async fn handle_user_prompt(
     StatusCode::OK
 }
 
+/// Debug: emit a test event by name
+async fn handle_test_emit(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> StatusCode {
+    let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    let data = payload.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    println!("[Pawkit] Test emit: event={} data={}", event, data);
+    let _ = state.app_handle.emit(event, data);
+    StatusCode::OK
+}
+
 /// Start the HTTP hook server on the given port
 pub fn start_hook_server(
     app_handle: tauri::AppHandle,
@@ -435,6 +447,7 @@ pub fn start_hook_server(
         .route("/hook/pre-tool-use", post(handle_pre_tool_use))
         .route("/hook/notification", post(handle_notification))
         .route("/hook/user-prompt", post(handle_user_prompt))
+        .route("/hook/test-emit", post(handle_test_emit))
         .with_state(state);
 
     tauri::async_runtime::spawn(async move {
