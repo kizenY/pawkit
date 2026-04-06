@@ -11,7 +11,13 @@ extern "system" {
     fn SetForegroundWindow(hwnd: isize) -> i32;
     fn ShowWindow(hwnd: isize, cmd_show: i32) -> i32;
     fn GetForegroundWindow() -> isize;
+    fn keybd_event(bvk: u8, bscan: u8, dwflags: u32, dwextrainfo: usize);
 }
+
+#[cfg(target_os = "windows")]
+const VK_MENU: u8 = 0x12; // Alt key
+#[cfg(target_os = "windows")]
+const KEYEVENTF_KEYUP: u32 = 0x0002;
 
 #[cfg(target_os = "windows")]
 const SW_RESTORE: i32 = 9;
@@ -43,6 +49,7 @@ unsafe extern "system" fn enum_callback(hwnd: isize, lparam: isize) -> i32 {
 }
 
 /// Find a window with "claude" in its title and bring it to the foreground.
+/// Uses the Alt key trick to bypass Windows' foreground lock restriction.
 /// Returns true if a matching window was found and focused.
 #[cfg(target_os = "windows")]
 pub fn focus_claude_window() -> bool {
@@ -50,6 +57,11 @@ pub fn focus_claude_window() -> bool {
     unsafe {
         EnumWindows(enum_callback, &mut found as *mut isize as isize);
         if found != 0 {
+            // Simulate Alt key press/release to release the foreground lock.
+            // Without this, SetForegroundWindow silently fails when called
+            // from a window that isn't currently in the foreground.
+            keybd_event(VK_MENU, 0, 0, 0);
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
             ShowWindow(found, SW_RESTORE);
             SetForegroundWindow(found);
             true

@@ -152,6 +152,38 @@ impl SlackBridge {
         Ok(data["ts"].as_str().unwrap_or("").to_string())
     }
 
+    /// Set typing/thinking status via Slack's Agents & Assistants API.
+    /// Requires `assistant:write` scope. Best-effort — silently fails if not available.
+    pub async fn set_status(&self, status: &str) -> Result<(), String> {
+        let channel = self.dm_channel_id.lock().await.clone();
+        let thread_ts = self.active_thread_ts.lock().await.clone();
+        if thread_ts.is_empty() {
+            return Ok(());
+        }
+        let _ = self.api_post("assistant.threads.setStatus", &serde_json::json!({
+            "channel_id": channel,
+            "thread_ts": thread_ts,
+            "status": status,
+        })).await;
+        Ok(())
+    }
+
+    /// Clear the typing/thinking status
+    pub async fn clear_status(&self) -> Result<(), String> {
+        self.set_status("").await
+    }
+
+    /// Update a message in-place (e.g. to resolve auth buttons)
+    pub async fn update_message(&self, channel: &str, ts: &str, text: &str, blocks: &serde_json::Value) -> Result<(), String> {
+        self.api_post("chat.update", &serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+            "text": text,
+            "blocks": blocks,
+        })).await?;
+        Ok(())
+    }
+
     pub async fn set_active_thread(&self, ts: &str) {
         *self.active_thread_ts.lock().await = ts.to_string();
     }
@@ -245,13 +277,34 @@ fn extract_user_message(envelope: &serde_json::Value, dm_user_id: &str, dm_chann
     Some(UserMessage { text, thread_ts })
 }
 
-fn extract_button_action(envelope: &serde_json::Value) -> Option<(String, String)> {
+struct ButtonAction {
+    action_id: String,
+    message_ts: String,
+    channel_id: String,
+    /// The original section text from the auth request message
+    original_section: String,
+}
+
+fn extract_button_action(envelope: &serde_json::Value) -> Option<ButtonAction> {
     let payload = envelope.get("payload")?;
     let actions = payload.get("actions")?.as_array()?;
     let action = actions.first()?;
     let action_id = action.get("action_id")?.as_str()?.to_string();
-    let value = action.get("value")?.as_str()?.to_string();
-    Some((action_id, value))
+    let message_ts = payload.get("message")?.get("ts")?.as_str()?.to_string();
+    let channel_id = payload.get("channel")?.get("id")?.as_str()?.to_string();
+
+    // Extract the original section text from message blocks
+    let original_section = payload.get("message")
+        .and_then(|m| m.get("blocks"))
+        .and_then(|b| b.as_array())
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block.get("text"))
+        .and_then(|t| t.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(ButtonAction { action_id, message_ts, channel_id, original_section })
 }
 
 // ── Main session loop ──
@@ -380,13 +433,36 @@ pub async fn run_remote_session(
                 let env_type = envelope.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if env_type == "disconnect" { break; }
 
-                // Button clicks
+                // Button clicks — update original message in-place (grey out buttons)
                 if env_type == "interactive" {
-                    if let Some((action_id, _)) = extract_button_action(&envelope) {
-                        let allow = action_id == "auth_allow";
+                    if let Some(action) = extract_button_action(&envelope) {
+                        let allow = action.action_id == "auth_allow";
                         if resolve_first_pending(&ws_pending, allow).await {
-                            let (emoji, action) = if allow { ("✅", "已允许") } else { ("❌", "已拒绝") };
-                            let _ = ws_slack.reply(&format!("{} {}", emoji, action)).await;
+                            let (emoji, label) = if allow { ("✅", "已允许") } else { ("❌", "已拒绝") };
+                            // Replace the buttons with a resolved status line
+                            let updated_blocks = serde_json::json!([
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": action.original_section
+                                    }
+                                },
+                                {
+                                    "type": "context",
+                                    "elements": [{
+                                        "type": "mrkdwn",
+                                        "text": format!("{} _{}_", emoji, label)
+                                    }]
+                                }
+                            ]);
+                            let fallback = format!("{} {}", emoji, label);
+                            let _ = ws_slack.update_message(
+                                &action.channel_id,
+                                &action.message_ts,
+                                &fallback,
+                                &updated_blocks,
+                            ).await;
                         }
                     }
                     continue;
@@ -508,10 +584,16 @@ pub async fn run_remote_session(
                 let _ = proc_slack.reply("🆕 _新会话_").await;
             }
 
-            let _ = proc_slack.reply("⏳ _处理中..._").await;
+            // Show typing indicator via Slack Assistants API (best-effort)
+            let _ = proc_slack.set_status("🤔 思考中...").await;
 
             let mut session = proc_session.lock().await;
-            match session.run_prompt(&prompt.text).await {
+            let result = session.run_prompt(&prompt.text).await;
+
+            // Clear typing indicator
+            let _ = proc_slack.clear_status().await;
+
+            match result {
                 Ok(output) => {
                     if output.is_error {
                         let _ = proc_slack.reply(&format!("⚠️ Claude 返回错误:\n```\n{}\n```", output.text)).await;

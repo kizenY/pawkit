@@ -18,16 +18,22 @@ let unlistenMode: UnlistenFn | null = null;
 let unlistenTaskDone: UnlistenFn | null = null;
 let unlistenTerminalFocused: UnlistenFn | null = null;
 
+// Pre-create Audio objects to avoid autoplay policy issues.
+// Webview may block new Audio().play() from non-user-interaction contexts.
+// By reusing the same Audio objects, once unlocked by a click they stay unlocked.
+const meowAudio = new Audio(meowSound);
+meowAudio.volume = 0.5;
+const bellAudio = new Audio(bellSound);
+bellAudio.volume = 0.7;
+
 function playMeow() {
-  const audio = new Audio(meowSound);
-  audio.volume = 0.5;
-  audio.play().catch(() => {});
+  meowAudio.currentTime = 0;
+  meowAudio.play().catch(() => {});
 }
 
 function playBell() {
-  const audio = new Audio(bellSound);
-  audio.volume = 0.7;
-  audio.play().catch(() => {});
+  bellAudio.currentTime = 0;
+  bellAudio.play().catch(() => {});
 }
 
 async function onContextMenu(e: MouseEvent) {
@@ -35,11 +41,9 @@ async function onContextMenu(e: MouseEvent) {
   await invoke("show_context_menu");
 }
 
-async function onClick() {
+function onClick() {
   if (hasUnread.value) {
-    // Has unread: focus Claude terminal and clear bell
     hasUnread.value = false;
-    await invoke("focus_claude_terminal");
   } else {
     playMeow();
   }
@@ -86,8 +90,9 @@ onMounted(async () => {
       petState.value = "idle";
     }
   });
-  // Claude Code task completed — show bell as unread indicator
+  // Claude Code task completed — show bell as unread indicator (skip in away mode)
   unlistenTaskDone = await listen("claude_task_done", () => {
+    if (isAway.value) return;
     hasUnread.value = true;
     playBell();
   });

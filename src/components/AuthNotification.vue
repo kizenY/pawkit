@@ -37,6 +37,16 @@ async function respond(allow: boolean) {
   processQueue();
 }
 
+async function respondAllowAll() {
+  if (!current.value) return;
+  await invoke("respond_auth_all", {
+    requestId: current.value.request_id,
+    toolName: current.value.tool_name,
+  });
+  current.value = null;
+  processQueue();
+}
+
 onMounted(async () => {
   unlisten = await listen<AuthRequest>("claude_auth_request", (event) => {
     queue.value.push(event.payload);
@@ -61,6 +71,7 @@ onUnmounted(() => {
       </div>
       <div class="auth-buttons">
         <button class="btn-deny" @mousedown.prevent @click="respond(false)">Deny</button>
+        <button class="btn-allow-all" @mousedown.prevent @click="respondAllowAll">All</button>
         <button class="btn-allow" @mousedown.prevent @click="respond(true)">Allow</button>
       </div>
     </div>
@@ -145,6 +156,11 @@ onUnmounted(() => {
 .btn-allow {
   background: #44bb44;
   color: #fff;
+}
+
+.btn-allow-all {
+  background: #2d8a4e;
+  color: #ccc;
 }
 
 .btn-deny {

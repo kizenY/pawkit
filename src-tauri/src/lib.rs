@@ -7,7 +7,7 @@ mod win_focus;
 
 use config::SharedConfig;
 use executor::{execute_action, ActionResult};
-use hook_server::{AuthDecision, LastTerminalSession, PendingRequests};
+use hook_server::{AuthDecision, LastTerminalSession, PendingRequests, SessionAllowTools};
 use slack_bridge::SlackBridge;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,9 @@ use tauri::{
 };
 
 const HOOK_SERVER_PORT: u16 = 9527;
+
+/// Wrapper so we can manage Arc<AtomicBool> as Tauri state
+struct AwayFlag(Arc<AtomicBool>);
 
 #[tauri::command]
 fn get_actions(state: tauri::State<SharedConfig>) -> Vec<config::Action> {
@@ -86,6 +89,31 @@ async fn respond_auth(
     }
 }
 
+/// Allow this request AND auto-allow all future requests for the same tool type this session
+#[tauri::command]
+async fn respond_auth_all(
+    request_id: String,
+    tool_name: String,
+    pending: tauri::State<'_, PendingRequests>,
+    session_tools: tauri::State<'_, SessionAllowTools>,
+) -> Result<bool, String> {
+    // Add tool to session auto-allow list
+    {
+        let mut tools = session_tools.lock().await;
+        if !tools.contains(&tool_name) {
+            tools.push(tool_name);
+        }
+    }
+    // Allow this request
+    let mut pending = pending.lock().await;
+    if let Some(tx) = pending.remove(&request_id) {
+        let _ = tx.send(AuthDecision::Allow);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[tauri::command]
 fn get_hook_port() -> u16 {
     HOOK_SERVER_PORT
@@ -108,16 +136,32 @@ fn reload_config(state: tauri::State<SharedConfig>) -> bool {
 async fn show_context_menu(
     window: WebviewWindow,
     state: tauri::State<'_, SharedConfig>,
+    away_flag: tauri::State<'_, AwayFlag>,
 ) -> Result<(), String> {
     let actions = {
         let config = state.lock().unwrap();
         config.actions.actions.clone()
     };
+    let is_away = away_flag.0.load(Ordering::SeqCst);
 
     let app = window.app_handle();
 
     // Build menu from actions config
     let mut menu_builder = MenuBuilder::new(app);
+
+    // Away/Home toggle — show only the opposite of current state
+    if is_away {
+        let home_item = MenuItemBuilder::with_id("_pawkit_home", "🏠 回家了")
+            .build(app)
+            .map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&home_item);
+    } else {
+        let away_item = MenuItemBuilder::with_id("_pawkit_away", "🏖 外出模式")
+            .build(app)
+            .map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&away_item);
+    }
+    menu_builder = menu_builder.separator();
 
     // Group actions
     let mut groups: std::collections::BTreeMap<String, Vec<&config::Action>> = std::collections::BTreeMap::new();
@@ -183,24 +227,14 @@ async fn show_context_menu(
 
 fn build_tray_menu(
     app: &tauri::App,
-    is_away: Arc<AtomicBool>,
-    pending: PendingRequests,
-    slack: Option<Arc<SlackBridge>>,
-    auto_approve: Arc<AtomicBool>,
-    last_terminal_session: LastTerminalSession,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItemBuilder::with_id("show", "Show Pawkit").build(app)?;
     let hide = MenuItemBuilder::with_id("hide", "Hide Pawkit").build(app)?;
-    let away = MenuItemBuilder::with_id("away", "🏖 外出模式").build(app)?;
-    let home = MenuItemBuilder::with_id("home", "🏠 回家了").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&show)
         .item(&hide)
-        .separator()
-        .item(&away)
-        .item(&home)
         .separator()
         .item(&quit)
         .build()?;
@@ -221,53 +255,6 @@ fn build_tray_menu(
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.hide();
                     }
-                }
-                "away" => {
-                    if is_away.load(Ordering::SeqCst) {
-                        return; // Already in away mode
-                    }
-
-                    // Load slack config
-                    let config_dir = config::get_config_dir();
-                    let slack_config = config::load_slack_config(&config_dir);
-
-                    if slack_config.bot_token.is_empty() || slack_config.dm_user_id.is_empty() {
-                        eprintln!("[Pawkit] Slack 未配置 bot_token 或 dm_user_id，无法进入外出模式");
-                        return;
-                    }
-
-                    is_away.store(true, Ordering::SeqCst);
-
-                    let away_flag = is_away.clone();
-                    let pending_clone = pending.clone();
-                    let slack_clone = slack.clone();
-
-                    let session_id_clone = last_terminal_session.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Some(slack) = slack_clone {
-                            let initial_session = session_id_clone.lock().await.clone();
-                            slack_bridge::run_remote_session(
-                                slack,
-                                pending_clone,
-                                away_flag,
-                                slack_config,
-                                initial_session,
-                            )
-                            .await;
-                        }
-                    });
-
-                    let _ = app.emit("mode_changed", "away");
-                    println!("[Pawkit] 已切换到外出模式");
-                }
-                "home" => {
-                    if !is_away.load(Ordering::SeqCst) {
-                        return; // Already home
-                    }
-                    is_away.store(false, Ordering::SeqCst);
-                    auto_approve.store(false, Ordering::SeqCst);
-                    let _ = app.emit("mode_changed", "home");
-                    println!("[Pawkit] 已切换到回家模式");
                 }
                 "quit" => {
                     app.exit(0);
@@ -329,6 +316,7 @@ pub fn run() {
     // Shared mode state
     let is_away = Arc::new(AtomicBool::new(false));
     let auto_approve = Arc::new(AtomicBool::new(false));
+    let session_allow_tools: SessionAllowTools = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let last_terminal_session: LastTerminalSession = Arc::new(tokio::sync::Mutex::new(
         hook_server::load_last_terminal_session(),
     ));
@@ -352,6 +340,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(shared_config.clone())
         .manage(pending_requests.clone())
+        .manage(AwayFlag(is_away.clone()))
+        .manage(session_allow_tools.clone())
         .invoke_handler(tauri::generate_handler![
             get_actions,
             get_pet_config,
@@ -359,6 +349,7 @@ pub fn run() {
             reload_config,
             show_context_menu,
             respond_auth,
+            respond_auth_all,
             get_hook_port,
             focus_claude_terminal,
         ])
@@ -374,14 +365,7 @@ pub fn run() {
                 let _ = window_vibrancy::clear_blur(&window);
             }
 
-            build_tray_menu(
-                app,
-                is_away.clone(),
-                pending_requests.clone(),
-                slack_bridge.clone(),
-                auto_approve.clone(),
-                last_terminal_session.clone(),
-            )?;
+            build_tray_menu(app)?;
 
             let app_handle = app.handle().clone();
             start_config_watcher(app_handle.clone(), shared_config.clone());
@@ -396,6 +380,7 @@ pub fn run() {
                 auto_approve.clone(),
                 slack_config.critical_tools.clone(),
                 last_terminal_session.clone(),
+                session_allow_tools.clone(),
             );
 
             // Poll foreground window to detect when user switches to Claude terminal
@@ -412,8 +397,13 @@ pub fn run() {
                 }
             });
 
-            // Handle native context menu events
+            // Handle native context menu events (including away/home mode)
             let menu_config = shared_config.clone();
+            let menu_is_away = is_away.clone();
+            let menu_pending = pending_requests.clone();
+            let menu_slack = slack_bridge.clone();
+            let menu_auto = auto_approve.clone();
+            let menu_session = last_terminal_session.clone();
             app.on_menu_event(move |app, event| {
                 let id = event.id().as_ref().to_string();
 
@@ -422,6 +412,45 @@ pub fn run() {
                     return;
                 }
                 if id.starts_with("_group_") {
+                    return;
+                }
+
+                // Away/Home mode from context menu
+                if id == "_pawkit_away" {
+                    if menu_is_away.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let config_dir = config::get_config_dir();
+                    let slack_config = config::load_slack_config(&config_dir);
+                    if slack_config.bot_token.is_empty() || slack_config.dm_user_id.is_empty() {
+                        eprintln!("[Pawkit] Slack 未配置 bot_token 或 dm_user_id，无法进入外出模式");
+                        return;
+                    }
+                    menu_is_away.store(true, Ordering::SeqCst);
+                    let away_flag = menu_is_away.clone();
+                    let pending_clone = menu_pending.clone();
+                    let slack_clone = menu_slack.clone();
+                    let session_clone = menu_session.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(slack) = slack_clone {
+                            let initial_session = session_clone.lock().await.clone();
+                            slack_bridge::run_remote_session(
+                                slack, pending_clone, away_flag, slack_config, initial_session,
+                            ).await;
+                        }
+                    });
+                    let _ = app.emit("mode_changed", "away");
+                    println!("[Pawkit] 已切换到外出模式");
+                    return;
+                }
+                if id == "_pawkit_home" {
+                    if !menu_is_away.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    menu_is_away.store(false, Ordering::SeqCst);
+                    menu_auto.store(false, Ordering::SeqCst);
+                    let _ = app.emit("mode_changed", "home");
+                    println!("[Pawkit] 已切换到回家模式");
                     return;
                 }
 

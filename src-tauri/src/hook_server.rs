@@ -64,6 +64,9 @@ pub struct TerminalSession {
 
 pub type LastTerminalSession = Arc<Mutex<Option<TerminalSession>>>;
 
+/// Tools the user has chosen to auto-allow for this session ("Allow All")
+pub type SessionAllowTools = Arc<Mutex<Vec<String>>>;
+
 #[derive(Clone)]
 struct AppState {
     pending: PendingRequests,
@@ -73,6 +76,7 @@ struct AppState {
     auto_approve: Arc<AtomicBool>,
     critical_tools: Vec<String>,
     last_terminal_session: LastTerminalSession,
+    session_allow_tools: SessionAllowTools,
 }
 
 /// Summarize tool input into a short readable string
@@ -280,6 +284,14 @@ async fn handle_pre_tool_use(
         return make_allow_response();
     }
 
+    // Auto-allow tools the user chose "Allow All" for this session
+    {
+        let session_tools = state.session_allow_tools.lock().await;
+        if session_tools.iter().any(|t| t == &tool_name) {
+            return make_allow_response();
+        }
+    }
+
     let summary = summarize_tool_input(&tool_name, &input.tool_input);
 
     // === Away mode: route to Slack ===
@@ -349,8 +361,9 @@ async fn handle_pre_tool_use(
     };
     let _ = state.app_handle.emit("claude_auth_request", &payload);
 
-    // Wait for user decision (2 min timeout for local)
-    let decision = match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+    // Wait for user decision (115s timeout — 5s less than Claude Code's 120s HTTP timeout
+    // to ensure we always return a response before the HTTP connection drops)
+    let decision = match tokio::time::timeout(std::time::Duration::from_secs(115), rx).await {
         Ok(Ok(decision)) => decision,
         _ => {
             let mut pending = state.pending.lock().await;
@@ -372,6 +385,7 @@ pub fn start_hook_server(
     auto_approve: Arc<AtomicBool>,
     critical_tools: Vec<String>,
     last_terminal_session: LastTerminalSession,
+    session_allow_tools: SessionAllowTools,
 ) {
     let state = AppState {
         pending,
@@ -381,6 +395,7 @@ pub fn start_hook_server(
         auto_approve,
         critical_tools,
         last_terminal_session,
+        session_allow_tools,
     };
 
     let app = Router::new()
