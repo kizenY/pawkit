@@ -67,7 +67,7 @@ actions:
     icon: "🚀"
     type: shell
     command: "npm run release"
-    workdir: "E:/projects/my-app"
+    workdir: "/path/to/your/project"
     confirm: true
     group: "部署"
 
@@ -87,10 +87,10 @@ actions:
     steps:
       - type: shell
         command: "pnpm build"
-        workdir: "E:/projects/my-app"
+        workdir: "/path/to/your/project"
       - type: shell
         command: "pnpm deploy:staging"
-        workdir: "E:/projects/my-app"
+        workdir: "/path/to/your/project"
       - type: http
         method: POST
         url: "https://hooks.slack.com/services/xxx"
@@ -114,7 +114,7 @@ actions:
     steps:
       - type: shell
         command: "git fetch --all && git pull --rebase"
-        workdir: "E:/projects/my-app"
+        workdir: "/path/to/your/project"
 ```
 
 ### Rules
@@ -158,7 +158,7 @@ Each log file contains:
 ```
 [INFO] Action started: release (2026-04-06 14:30:00)
 [INFO] Command: npm run release
-[INFO] Workdir: E:/projects/my-app
+[INFO] Workdir: /path/to/your/project
 [STDOUT] ...
 [STDERR] ...
 [INFO] Exit code: 0

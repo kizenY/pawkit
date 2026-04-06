@@ -13,7 +13,7 @@ Executes a shell command via the system shell (`cmd /C` on Windows, `sh -c` on U
   name: "构建项目"
   type: shell
   command: "pnpm build"
-  workdir: "E:/projects/app"
+  workdir: "/path/to/your/project"
   env:
     NODE_ENV: production
 ```
@@ -89,10 +89,10 @@ Executes multiple steps sequentially. Each step is a `shell`, `http`, or `url` a
   steps:
     - type: shell
       command: "pnpm test"
-      workdir: "E:/projects/app"
+      workdir: "/path/to/your/project"
     - type: shell
       command: "pnpm build"
-      workdir: "E:/projects/app"
+      workdir: "/path/to/your/project"
     - type: http
       method: POST
       url: "https://deploy.example.com/trigger"

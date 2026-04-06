@@ -4,12 +4,10 @@
 # This file is hot-reloaded — changes take effect immediately.
 
 actions:
-  - id: example-hello
-    name: "Hello World"
-    icon: "👋"
-    type: shell
-    command: "echo Hello from Pawkit!"
-    group: "示例"
+  - id: meow
+    name: "喵~"
+    icon: "🐱"
+    type: meow
 
   - id: example-open-github
     name: "打开 GitHub"

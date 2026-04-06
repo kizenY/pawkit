@@ -1,52 +1,51 @@
 <script setup lang="ts">
 import Pet from "./components/Pet.vue";
-import ContextMenu from "./components/ContextMenu.vue";
-import { useActions } from "./composables/useActions";
-import { ref } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import meowSound from "./assets/sounds/meow.mp3";
 
-const { actions, runAction } = useActions();
-const menuVisible = ref(false);
-const menuX = ref(0);
-const menuY = ref(0);
 const petState = ref<"idle" | "busy" | "success" | "fail" | "sleep">("idle");
+let unlistenStarted: UnlistenFn | null = null;
+let unlistenFinished: UnlistenFn | null = null;
 
-function onContextMenu(e: MouseEvent) {
+function playMeow() {
+  const audio = new Audio(meowSound);
+  audio.volume = 0.5;
+  audio.play().catch(() => {});
+}
+
+async function onContextMenu(e: MouseEvent) {
   e.preventDefault();
-  menuX.value = e.clientX;
-  menuY.value = e.clientY;
-  menuVisible.value = true;
+  await invoke("show_context_menu");
 }
 
-function closeMenu() {
-  menuVisible.value = false;
+function onClick() {
+  playMeow();
 }
 
-async function onActionSelect(actionId: string) {
-  menuVisible.value = false;
-  petState.value = "busy";
-  try {
-    const result = await runAction(actionId);
-    petState.value = result.success ? "success" : "fail";
-  } catch {
-    petState.value = "fail";
-  }
-  setTimeout(() => {
-    petState.value = "idle";
-  }, 2000);
-}
+onMounted(async () => {
+  unlistenStarted = await listen("action_started", () => {
+    petState.value = "busy";
+    playMeow();
+  });
+  unlistenFinished = await listen<{ success: boolean }>("action_finished", (event) => {
+    petState.value = event.payload.success ? "success" : "fail";
+    setTimeout(() => {
+      petState.value = "idle";
+    }, 2000);
+  });
+});
+
+onUnmounted(() => {
+  unlistenStarted?.();
+  unlistenFinished?.();
+});
 </script>
 
 <template>
-  <div class="app" @contextmenu="onContextMenu" @click="closeMenu">
+  <div class="app" @contextmenu="onContextMenu" @click="onClick">
     <Pet :state="petState" />
-    <ContextMenu
-      v-if="menuVisible"
-      :actions="actions"
-      :x="menuX"
-      :y="menuY"
-      @select="onActionSelect"
-      @close="closeMenu"
-    />
   </div>
 </template>
 

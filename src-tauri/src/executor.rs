@@ -16,6 +16,7 @@ pub fn execute_action(action: &Action) -> ActionResult {
     let start = std::time::Instant::now();
 
     let result = match action.action_type.as_str() {
+        "meow" => Ok(("meow!".to_string(), String::new(), Some(0))),
         "shell" => execute_shell(action),
         "script" => execute_script(action),
         "url" => execute_url(action),

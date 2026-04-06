@@ -2,7 +2,7 @@
 name = "pawkit"
 version = "0.1.0"
 description = "Desktop pet with customizable quick actions"
-authors = ["you"]
+authors = ["kizenY"]
 edition = "2021"
 
 [lib]
@@ -26,3 +26,4 @@ dirs = "6"
 chrono = "0.4"
 tokio = { version = "1", features = ["process", "io-util", "rt"] }
 regex-lite = "0.1"
+window-vibrancy = "0.6"

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Emitter, Manager,
+    Emitter, Manager, WebviewWindow,
 };
 
 #[tauri::command]
@@ -63,6 +63,83 @@ fn reload_config(state: tauri::State<SharedConfig>) -> bool {
     let mut config = state.lock().unwrap();
     *config = new_config;
     true
+}
+
+#[tauri::command]
+async fn show_context_menu(
+    window: WebviewWindow,
+    state: tauri::State<'_, SharedConfig>,
+) -> Result<(), String> {
+    let actions = {
+        let config = state.lock().unwrap();
+        config.actions.actions.clone()
+    };
+
+    let app = window.app_handle();
+
+    // Build menu from actions config
+    let mut menu_builder = MenuBuilder::new(app);
+
+    // Group actions
+    let mut groups: std::collections::BTreeMap<String, Vec<&config::Action>> = std::collections::BTreeMap::new();
+    let mut ungrouped: Vec<&config::Action> = Vec::new();
+
+    for action in &actions {
+        if !action.enabled {
+            continue;
+        }
+        if let Some(ref group) = action.group {
+            groups.entry(group.clone()).or_default().push(action);
+        } else {
+            ungrouped.push(action);
+        }
+    }
+
+    // Add ungrouped items first
+    for action in &ungrouped {
+        let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
+        let item = MenuItemBuilder::with_id(&action.id, label)
+            .build(app)
+            .map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&item);
+    }
+
+    // Add grouped items with submenu headers
+    for (group_name, group_actions) in &groups {
+        if !ungrouped.is_empty() || groups.len() > 1 {
+            menu_builder = menu_builder.separator();
+        }
+        // Add group label as disabled item
+        let group_label = MenuItemBuilder::with_id(
+            format!("_group_{}", group_name),
+            format!("  {}  ", group_name),
+        )
+        .enabled(false)
+        .build(app)
+        .map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&group_label);
+
+        for action in group_actions {
+            let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
+            let item = MenuItemBuilder::with_id(&action.id, label)
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            menu_builder = menu_builder.item(&item);
+        }
+    }
+
+    // Add separator and Quit
+    menu_builder = menu_builder.separator();
+    let quit_item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
+        .build(app)
+        .map_err(|e| e.to_string())?;
+    menu_builder = menu_builder.item(&quit_item);
+
+    let menu = menu_builder.build().map_err(|e| e.to_string())?;
+
+    window.popup_menu(&menu).map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 fn build_tray_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -157,11 +234,53 @@ pub fn run() {
             get_pet_config,
             run_action,
             reload_config,
+            show_context_menu,
         ])
         .setup(move |app| {
+            // Fix transparent window on Windows - clear both window and webview backgrounds
+            let window = app.get_webview_window("main").unwrap();
+            #[cfg(target_os = "windows")]
+            {
+                use tauri::window::Color;
+                // Clear the window background
+                let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+                // Clear the webview background via window-vibrancy
+                let _ = window_vibrancy::clear_blur(&window);
+            }
+
             build_tray_menu(app)?;
             let app_handle = app.handle().clone();
-            start_config_watcher(app_handle, shared_config.clone());
+            start_config_watcher(app_handle.clone(), shared_config.clone());
+
+            // Handle native context menu events
+            let menu_config = shared_config.clone();
+            app.on_menu_event(move |app, event| {
+                let id = event.id().as_ref().to_string();
+
+                if id == "_pawkit_quit" {
+                    app.exit(0);
+                    return;
+                }
+                if id.starts_with("_group_") {
+                    return;
+                }
+
+                // Find and execute the action
+                let action = {
+                    let config = menu_config.lock().unwrap();
+                    config.actions.actions.iter().find(|a| a.id == id).cloned()
+                };
+
+                if let Some(action) = action {
+                    let app_handle = app.clone();
+                    let _ = app_handle.emit("action_started", &action.id);
+                    std::thread::spawn(move || {
+                        let result = execute_action(&action);
+                        let _ = app_handle.emit("action_finished", &result);
+                    });
+                }
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())

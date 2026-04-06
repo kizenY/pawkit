@@ -114,13 +114,33 @@ pub struct AppConfig {
 }
 
 pub fn get_config_dir() -> PathBuf {
-    // In development, use project config/ directory
-    let dev_config = PathBuf::from("config");
-    if dev_config.exists() {
-        return dev_config;
+    // Try relative to the executable first (works for both dev and production)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            // In dev mode, exe is in src-tauri/target/debug, config is at project root
+            // Walk up to find config/ directory
+            let mut dir = exe_dir.to_path_buf();
+            for _ in 0..5 {
+                let config_candidate = dir.join("config");
+                if config_candidate.exists() {
+                    return config_candidate;
+                }
+                if let Some(parent) = dir.parent() {
+                    dir = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
-    // In production, use the app's resource directory or user config
+    // Try current working directory
+    let cwd_config = PathBuf::from("config");
+    if cwd_config.exists() {
+        return cwd_config;
+    }
+
+    // Fallback: user config directory
     if let Some(config_dir) = dirs::config_dir() {
         let app_config = config_dir.join("pawkit");
         if !app_config.exists() {
@@ -129,7 +149,7 @@ pub fn get_config_dir() -> PathBuf {
         return app_config;
     }
 
-    dev_config
+    cwd_config
 }
 
 pub fn load_actions(config_dir: &PathBuf) -> ActionsConfig {

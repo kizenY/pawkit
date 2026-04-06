@@ -15,6 +15,7 @@
         "title": "Pawkit",
         "transparent": true,
         "decorations": false,
+        "shadow": false,
         "alwaysOnTop": true,
         "resizable": false,
         "width": 200,
