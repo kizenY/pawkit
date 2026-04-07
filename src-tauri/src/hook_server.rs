@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::{oneshot, Mutex};
 
+use crate::plog;
 use crate::slack_bridge::SlackBridge;
 
 /// Pending auth requests waiting for user decision
@@ -246,7 +247,7 @@ async fn handle_notification(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> StatusCode {
-    println!("[Pawkit] Notification payload: {}", serde_json::to_string(&payload).unwrap_or_default());
+    plog!("[Pawkit] Notification payload: {}", serde_json::to_string(&payload).unwrap_or_default());
 
     // Capture session ID from notifications too — but only from terminal sessions
     let session_id = payload.get("session_id").and_then(|v| v.as_str());
@@ -291,11 +292,11 @@ async fn handle_pre_tool_use(
     // track terminal sessions, not Pawkit's own `claude -p` sessions from Slack.
     if let Some(ref sid) = input.session_id {
         if !state.is_away.load(Ordering::SeqCst) {
-            println!("[Pawkit] Captured terminal session_id: {} (tool={})", sid, tool_name);
+            plog!("[Pawkit] Captured terminal session_id: {} (tool={})", sid, tool_name);
             save_last_terminal_session(sid);
             *state.last_terminal_session.lock().await = load_last_terminal_session();
         } else {
-            println!("[Pawkit] Ignoring session_id from away-mode: {} (tool={})", sid, tool_name);
+            plog!("[Pawkit] Ignoring session_id from away-mode: {} (tool={})", sid, tool_name);
         }
     }
 
@@ -415,7 +416,7 @@ async fn handle_test_emit(
 ) -> StatusCode {
     let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
     let data = payload.get("data").cloned().unwrap_or(serde_json::Value::Null);
-    println!("[Pawkit] Test emit: event={} data={}", event, data);
+    plog!("[Pawkit] Test emit: event={} data={}", event, data);
     let _ = state.app_handle.emit(event, data);
     StatusCode::OK
 }
@@ -455,13 +456,13 @@ pub fn start_hook_server(
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[Pawkit] Failed to bind hook server on port {}: {}", port, e);
+                plog!("[Pawkit] Failed to bind hook server on port {}: {}", port, e);
                 return;
             }
         };
-        println!("[Pawkit] Hook server listening on http://127.0.0.1:{}", port);
+        plog!("[Pawkit] Hook server listening on http://127.0.0.1:{}", port);
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("[Pawkit] Hook server error: {}", e);
+            plog!("[Pawkit] Hook server error: {}", e);
         }
     });
 }
@@ -482,12 +483,12 @@ fn save_last_terminal_session(session_id: &str) {
     match serde_json::to_string(&ts) {
         Ok(json) => {
             if let Err(e) = std::fs::write(session_file_path(), &json) {
-                eprintln!("[Pawkit] Failed to persist session: {}", e);
+                plog!("[Pawkit] Failed to persist session: {}", e);
             } else {
-                println!("[Pawkit] Persisted terminal session: {}", json);
+                plog!("[Pawkit] Persisted terminal session: {}", json);
             }
         }
-        Err(e) => eprintln!("[Pawkit] Failed to serialize session: {}", e),
+        Err(e) => plog!("[Pawkit] Failed to serialize session: {}", e),
     }
 }
 
@@ -497,11 +498,11 @@ pub fn load_last_terminal_session() -> Option<TerminalSession> {
         Ok(s) if !s.trim().is_empty() => {
             match serde_json::from_str::<TerminalSession>(s.trim()) {
                 Ok(ts) => {
-                    println!("[Pawkit] Loaded persisted terminal session: {} (cwd={})", ts.session_id, ts.working_dir);
+                    plog!("[Pawkit] Loaded persisted terminal session: {} (cwd={})", ts.session_id, ts.working_dir);
                     Some(ts)
                 }
                 Err(e) => {
-                    eprintln!("[Pawkit] Failed to parse persisted session: {}", e);
+                    plog!("[Pawkit] Failed to parse persisted session: {}", e);
                     None
                 }
             }
@@ -531,7 +532,7 @@ fn resolve_session_working_dir(session_id: &str) -> Option<String> {
                     for line in content.lines().take(10) {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                             if let Some(cwd) = json.get("cwd").and_then(|v| v.as_str()) {
-                                println!("[Pawkit] Resolved session {} cwd: {}", session_id, cwd);
+                                plog!("[Pawkit] Resolved session {} cwd: {}", session_id, cwd);
                                 return Some(cwd.to_string());
                             }
                         }

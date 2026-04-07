@@ -1,3 +1,4 @@
+use crate::plog;
 use crate::claude_session::{ClaudeOutput, ClaudeSession};
 use crate::config::AutoReviewConfig;
 use crate::slack_bridge::SlackBridge;
@@ -92,13 +93,13 @@ pub fn start_auto_review(
     is_away: Arc<AtomicBool>,
 ) {
     if !config.enabled {
-        println!("[Pawkit] Auto-review disabled");
+        plog!("[Pawkit] Auto-review disabled");
         return;
     }
     if config.repos.is_empty() {
-        println!("[Pawkit] Auto-review enabled for ALL repos (no repo filter)");
+        plog!("[Pawkit] Auto-review enabled for ALL repos (no repo filter)");
     } else {
-        println!("[Pawkit] Auto-review enabled for repos: {:?}", config.repos);
+        plog!("[Pawkit] Auto-review enabled for repos: {:?}", config.repos);
     }
 
     let (approved_tx, approved_rx) = mpsc::channel::<ReviewItem>(32);
@@ -115,11 +116,11 @@ pub fn start_auto_review(
         // Get GitHub token once at startup
         let token = match get_github_token(&poll_config.gh_account).await {
             Ok(t) => {
-                println!("[Pawkit] GitHub token acquired");
+                plog!("[Pawkit] GitHub token acquired");
                 t
             }
             Err(e) => {
-                eprintln!("[Pawkit] Failed to get GitHub token: {}. Auto-review polling disabled.", e);
+                plog!("[Pawkit] Failed to get GitHub token: {}. Auto-review polling disabled.", e);
                 return;
             }
         };
@@ -134,7 +135,7 @@ pub fn start_auto_review(
                 &client, &poll_handle, &poll_config, &poll_seen, &poll_pending,
                 &poll_slack, &poll_away,
             ).await {
-                eprintln!("[Pawkit] Auto-review poll error: {}", e);
+                plog!("[Pawkit] Auto-review poll error: {}", e);
             }
             tokio::time::sleep(interval).await;
         }
@@ -178,7 +179,12 @@ async fn notify_review_item(
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
 ) {
-    let type_label = if item.item_type == "review_request" { "Review Request" } else { "@Mention" };
+    let type_label = match item.item_type.as_str() {
+        "review_request" => "Review Request",
+        "mention" => "@Mention",
+        "comment" => "New Comment",
+        _ => "Notification",
+    };
 
     if is_away.load(Ordering::SeqCst) {
         if let Some(ref slack) = slack {
@@ -251,7 +257,7 @@ async fn poll_github(
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    println!("[Pawkit] Polling GitHub for review items...");
+    plog!("[Pawkit] Polling GitHub for review items...");
 
     // 1. Check review requests
     if config.repos.is_empty() {
@@ -293,7 +299,7 @@ async fn poll_github(
                     body: String::new(),
                 };
 
-                println!("[Pawkit] Found review request: {} #{}", repo, number);
+                plog!("[Pawkit] Found review request: {} #{}", repo, number);
                 pending.lock().await.push(review_item.clone());
                 notify_review_item(app_handle, &review_item, slack, is_away).await;
             }
@@ -310,7 +316,7 @@ async fn poll_github(
             let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[Pawkit] Failed to search PRs for {}: {}", repo, e);
+                    plog!("[Pawkit] Failed to search PRs for {}: {}", repo, e);
                     continue;
                 }
             };
@@ -344,17 +350,16 @@ async fn poll_github(
                     body: String::new(),
                 };
 
-                println!("[Pawkit] Found review request: {} #{}", repo, number);
+                plog!("[Pawkit] Found review request: {} #{}", repo, number);
                 pending.lock().await.push(review_item.clone());
                 notify_review_item(app_handle, &review_item, slack, is_away).await;
             }
         }
     }
 
-    // 2. Check notifications for mentions
+    // 2. Check notifications for mentions and new comments
     let resp = client
         .get("https://api.github.com/notifications")
-        .query(&[("reason", "mention")])
         .send().await
         .map_err(|e| format!("GitHub notifications API failed: {}", e))?;
 
@@ -362,18 +367,26 @@ async fn poll_github(
         .map_err(|e| format!("Failed to parse notifications: {}", e))?;
 
     for notif in notifications {
-        // The notifications API doesn't support reason filter as query param,
-        // so we filter client-side
-        if notif["reason"].as_str() != Some("mention") {
-            continue;
-        }
+        let reason = notif["reason"].as_str().unwrap_or("");
+        // Only handle mention, comment, and subscribed (PR participant) notifications
+        let item_type = match reason {
+            "mention" => "mention",
+            "comment" | "subscribed" => "comment",
+            _ => continue,
+        };
 
         let notif_id = notif["id"].as_str().unwrap_or("").to_string();
         let repo = notif["repository"]["full_name"].as_str().unwrap_or("").to_string();
-        let id = format!("mention_{}", notif_id);
+        let id = format!("{}_{}", item_type, notif_id);
 
         // Only track repos we're configured to watch (skip filter if repos list is empty = all repos)
         if !config.repos.is_empty() && !config.repos.iter().any(|r| r == &repo) {
+            continue;
+        }
+
+        // Only handle PR-related notifications
+        let subject_type = notif["subject"]["type"].as_str().unwrap_or("");
+        if subject_type != "PullRequest" {
             continue;
         }
 
@@ -396,7 +409,7 @@ async fn poll_github(
                     let state = pr_data["state"].as_str().unwrap_or("");
                     let merged = pr_data["merged"].as_bool().unwrap_or(false);
                     if state == "closed" || merged {
-                        println!("[Pawkit] Skipping {} #{}: {}", repo, pr_number,
+                        plog!("[Pawkit] Skipping {} #{}: {}", repo, pr_number,
                             if merged { "merged" } else { "closed" });
                         continue;
                     }
@@ -420,11 +433,11 @@ async fn poll_github(
             pr_number,
             title: notif["subject"]["title"].as_str().unwrap_or("").to_string(),
             url: web_url,
-            item_type: "mention".to_string(),
+            item_type: item_type.to_string(),
             body: comment_body,
         };
 
-        println!("[Pawkit] Found mention: {} #{}", repo, pr_number);
+        plog!("[Pawkit] Found {}: {} #{}", item_type, repo, pr_number);
         pending.lock().await.push(item.clone());
         notify_review_item(app_handle, &item, slack, is_away).await;
     }
@@ -475,7 +488,7 @@ async fn process_approved_items(
     };
 
     while let Some(item) = rx.recv().await {
-        println!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
+        plog!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
 
         // Notify Slack that we're starting
         if is_away.load(Ordering::SeqCst) {
@@ -493,7 +506,7 @@ async fn process_approved_items(
         let mut session = ClaudeSession::new(working_dir);
         match session.run_prompt(&prompt).await {
             Ok(output) => {
-                println!("[Pawkit] Review complete for {} #{}: {}",
+                plog!("[Pawkit] Review complete for {} #{}: {}",
                     item.repo, item.pr_number,
                     &output.text[..output.text.len().min(200)]);
 
@@ -501,9 +514,10 @@ async fn process_approved_items(
                 post_review_result_to_slack(slack, is_away, &item, &output).await;
 
                 // Mark notification as read
-                if item.item_type == "mention" {
+                if item.item_type == "mention" || item.item_type == "comment" {
                     if let Some(ref c) = client {
-                        let notif_id = item.id.strip_prefix("mention_").unwrap_or(&item.id);
+                        let prefix = format!("{}_", item.item_type);
+                        let notif_id = item.id.strip_prefix(&prefix).unwrap_or(&item.id);
                         mark_notification_read(c, notif_id).await;
                     }
                 }
@@ -511,7 +525,7 @@ async fn process_approved_items(
                 let _ = app_handle.emit("review_item_done", &item.id);
             }
             Err(e) => {
-                eprintln!("[Pawkit] Review failed for {} #{}: {}", item.repo, item.pr_number, e);
+                plog!("[Pawkit] Review failed for {} #{}: {}", item.repo, item.pr_number, e);
 
                 // Post error to Slack in away mode
                 post_review_error_to_slack(slack, is_away, &item, &e).await;
@@ -568,6 +582,33 @@ Steps:
    - If it asks for code changes: make the changes locally, commit, and push
    - If the PR is approved and they ask to merge: gh pr merge {number} --repo {repo} --squash
 3. Take the appropriate action.
+
+Write responses in English. Be concise."#,
+            number = item.pr_number,
+            title = item.title,
+            repo = item.repo,
+            body = if item.body.is_empty() { "(could not fetch comment)" } else { &item.body },
+        ),
+        "comment" => format!(
+            r#"There is a new comment on PR #{number} "{title}" in {repo}.
+
+The latest comment says:
+---
+{body}
+---
+
+Steps:
+1. Run: gh pr view {number} --repo {repo}   to understand the PR context
+2. Run: gh pr view {number} --repo {repo} --comments   to read the full comment thread
+3. Based on the comment and context, decide if this needs YOUR action:
+   - If the comment is asking you (the reviewer) for feedback, a re-review, or a response → take action
+   - If the comment is a follow-up to your previous review → take action
+   - If the comment is clearly directed at someone else or is just an FYI → do nothing
+4. If action is needed:
+   - To reply: gh pr comment {number} --repo {repo} --body "..."
+   - To re-review: review the PR diff and submit a review
+   - To approve after changes: gh pr review {number} --repo {repo} --approve --body "..."
+5. If no action is needed, just say "No action needed" and explain briefly why.
 
 Write responses in English. Be concise."#,
             number = item.pr_number,

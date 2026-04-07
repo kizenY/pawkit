@@ -46,11 +46,19 @@ async function onContextMenu(e: MouseEvent) {
 }
 
 function onClick() {
-  if (hasUnread.value || reviewBubble.value) {
+  if (hasUnread.value || reviewBubble.value || petState.value === "success") {
     hasUnread.value = false;
     reviewBubble.value = null;
-  } else {
-    playMeow();
+    petState.value = "idle";
+  }
+  // Terminal focus is handled by Pet.vue (only on click, not drag)
+}
+
+function onReviewActive(active: boolean) {
+  if (active && petState.value !== "waiting_auth") {
+    petState.value = "waiting_auth";
+  } else if (!active && petState.value === "waiting_auth" && !authActive.value) {
+    petState.value = "idle";
   }
 }
 
@@ -102,11 +110,10 @@ onMounted(async () => {
     if (isAway.value) return;
     // Clear busy state
     if (claudeIdleTimer) clearTimeout(claudeIdleTimer);
-    if (petState.value === "busy") {
-      petState.value = "idle";
-    }
     // New state clears the review "done" lightbulb
     if (reviewBubble.value === "done") reviewBubble.value = null;
+    // Enter success state with bell — stays until user clicks
+    petState.value = "success";
     hasUnread.value = true;
     playBell();
   });
@@ -142,10 +149,10 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app" @contextmenu="onContextMenu" @click="onClick">
-    <Pet :state="petState" :show-bell="hasUnread" :review-bubble="reviewBubble" />
+  <div class="app" @contextmenu="onContextMenu" @mousedown="onClick">
+    <Pet :state="petState" :show-bell="hasUnread" :review-bubble="reviewBubble" @pet-click="onClick" />
     <AuthNotification v-if="!isAway" @auth-active="onAuthActive" />
-    <ReviewNotification v-if="!isAway && !authActive" @review-bubble="(s: any) => reviewBubble = s" />
+    <ReviewNotification v-if="!isAway && !authActive" @review-active="onReviewActive" @review-bubble="(s: any) => reviewBubble = s" />
   </div>
 </template>
 

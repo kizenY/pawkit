@@ -86,7 +86,7 @@ onUnmounted(() => {
   <Transition name="slide-review">
     <div v-if="current && !processing" class="review-card" @mousedown.prevent>
       <div class="review-type">
-        {{ current.item_type === "review_request" ? "Review" : "@Mention" }}
+        {{ current.item_type === "review_request" ? "Review" : current.item_type === "comment" ? "Comment" : "@Mention" }}
       </div>
       <div class="review-title" @mousedown.prevent @click="openPr">
         {{ current.repo.split("/")[1] }}#{{ current.pr_number }}
