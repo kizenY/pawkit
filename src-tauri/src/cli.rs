@@ -1,6 +1,7 @@
 use crate::config::{get_config_dir, load_actions};
 use crate::executor::execute_action;
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 #[derive(Parser)]
@@ -50,25 +51,29 @@ pub fn run_cli(cmd: &Commands) {
                 return;
             }
 
-            // Collect groups
-            let mut current_group: Option<&str> = None;
+            // Group actions using BTreeMap for consistent sorted output
+            let mut groups: BTreeMap<Option<&str>, Vec<_>> = BTreeMap::new();
             for action in &actions {
-                let g = action.group.as_deref();
-                if g != current_group {
-                    if current_group.is_some() {
-                        println!();
-                    }
-                    if let Some(name) = g {
-                        println!("[{}]", name);
-                    }
-                    current_group = g;
+                groups.entry(action.group.as_deref()).or_default().push(action);
+            }
+
+            let mut first = true;
+            for (group_name, group_actions) in &groups {
+                if !first {
+                    println!();
                 }
-                let icon = action.icon.as_deref().unwrap_or(" ");
-                let confirm_mark = if action.confirm { " ⚠" } else { "" };
-                println!(
-                    "  {} {:<24} {}{}",
-                    icon, action.id, action.name, confirm_mark
-                );
+                first = false;
+                if let Some(name) = group_name {
+                    println!("[{}]", name);
+                }
+                for action in group_actions {
+                    let icon = action.icon.as_deref().unwrap_or(" ");
+                    let confirm_mark = if action.confirm { " ⚠" } else { "" };
+                    println!(
+                        "  {} {:<24} {}{}",
+                        icon, action.id, action.name, confirm_mark
+                    );
+                }
             }
         }
         Commands::Run { action_id, yes } => {
@@ -86,11 +91,17 @@ pub fn run_cli(cmd: &Commands) {
             };
 
             if action.confirm && !yes {
+                let is_tty = atty::is(atty::Stream::Stdin);
+                if !is_tty {
+                    eprintln!("Action '{}' requires confirmation. Use -y to skip, or run from an interactive terminal.", action.name);
+                    std::process::exit(1);
+                }
                 print!("Run '{}'? [y/N] ", action.name);
-                io::stdout().flush().unwrap();
+                let _ = io::stdout().flush();
                 let mut input = String::new();
-                io::stdin().read_line(&mut input).unwrap();
-                if !input.trim().eq_ignore_ascii_case("y") {
+                if io::stdin().read_line(&mut input).unwrap_or(0) == 0
+                    || !input.trim().eq_ignore_ascii_case("y")
+                {
                     println!("Cancelled.");
                     return;
                 }

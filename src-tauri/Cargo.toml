@@ -32,3 +32,4 @@ uuid = { version = "1", features = ["v4"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
+atty = "0.2"
