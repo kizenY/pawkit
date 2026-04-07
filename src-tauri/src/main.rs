@@ -4,11 +4,29 @@
 use clap::Parser;
 use pawkit_lib::cli::Cli;
 
+/// In release builds on Windows, `windows_subsystem = "windows"` hides the
+/// console. CLI subcommands need stdout/stderr, so we re-attach to the parent
+/// console (the terminal the user launched us from).
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    unsafe {
+        extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(cmd) => pawkit_lib::cli::run_cli(cmd),
+        Some(cmd) => {
+            #[cfg(target_os = "windows")]
+            attach_parent_console();
+            pawkit_lib::cli::run_cli(cmd);
+        }
         None => pawkit_lib::run(),
     }
 }
