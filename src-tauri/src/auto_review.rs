@@ -11,13 +11,19 @@ use tokio::sync::{mpsc, Mutex};
 
 /// Create a Command that runs `gh` directly (no shell intermediary).
 fn gh_command(args: &[&str]) -> tokio::process::Command {
-    if cfg!(target_os = "windows") {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         let mut cmd = tokio::process::Command::new("cmd");
         let mut all = vec!["/C", "gh"];
         all.extend_from_slice(args);
         cmd.args(all);
+        cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
-    } else {
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
         let mut cmd = tokio::process::Command::new("gh");
         cmd.args(args);
         cmd
