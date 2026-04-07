@@ -87,7 +87,7 @@ fn execute_script(action: &Action) -> ExecResult {
     } else if cfg!(target_os = "windows") {
         ("cmd", vec!["/C", path])
     } else {
-        ("sh", vec!["-c", path])
+        ("sh", vec![path])
     };
 
     let mut cmd = Command::new(program);

@@ -9,7 +9,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use tokio::sync::{mpsc, Mutex};
 
-/// Create a Command that runs `gh` through the platform shell.
+/// Create a Command that runs `gh` directly (no shell intermediary).
 fn gh_command(args: &[&str]) -> tokio::process::Command {
     if cfg!(target_os = "windows") {
         let mut cmd = tokio::process::Command::new("cmd");
@@ -18,9 +18,8 @@ fn gh_command(args: &[&str]) -> tokio::process::Command {
         cmd.args(all);
         cmd
     } else {
-        let mut cmd = tokio::process::Command::new("/bin/sh");
-        let escaped: Vec<String> = args.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect();
-        cmd.args(["-c", &format!("gh {}", escaped.join(" "))]);
+        let mut cmd = tokio::process::Command::new("gh");
+        cmd.args(args);
         cmd
     }
 }
@@ -200,9 +199,16 @@ async fn poll_github(
 
     // Switch gh account if configured
     if let Some(ref account) = config.gh_account {
-        let _ = gh_command(&["auth", "switch", "-u", account])
-            .output()
-            .await;
+        match gh_command(&["auth", "switch", "-u", account]).output().await {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!("[Pawkit] Failed to switch gh account to '{}': {}", account, stderr.trim());
+            }
+            Err(e) => {
+                eprintln!("[Pawkit] Failed to run gh auth switch: {}", e);
+            }
+            _ => {}
+        }
     }
 
     // 1. Check review requests for each repo
