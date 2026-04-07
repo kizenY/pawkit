@@ -39,9 +39,14 @@ pub fn start_auto_review(
     slack: Option<Arc<SlackBridge>>,
     is_away: Arc<AtomicBool>,
 ) {
-    if !config.enabled || config.repos.is_empty() {
-        println!("[Pawkit] Auto-review disabled or no repos configured");
+    if !config.enabled {
+        println!("[Pawkit] Auto-review disabled");
         return;
+    }
+    if config.repos.is_empty() {
+        println!("[Pawkit] Auto-review enabled for ALL repos (no repo filter)");
+    } else {
+        println!("[Pawkit] Auto-review enabled for repos: {:?}", config.repos);
     }
 
     let (approved_tx, approved_rx) = mpsc::channel::<ReviewItem>(32);
@@ -182,28 +187,29 @@ async fn poll_github(
 ) -> Result<(), String> {
     println!("[Pawkit] Polling GitHub for review items...");
 
-    // 1. Check review requests for each repo
-    for repo in &config.repos {
+    // 1. Check review requests
+    if config.repos.is_empty() {
+        // No repo filter: use gh search to find all PRs requesting review from @me
         let output = tokio::process::Command::new("cmd")
-            .args(["/C", "gh", "pr", "list",
-                "--repo", repo,
-                "--search", "review-requested:@me",
-                "--json", "number,title,url",
-                "--limit", "10"])
+            .args(["/C", "gh", "search", "prs",
+                "--review-requested=@me", "--state=open",
+                "--json", "number,title,url,repository",
+                "--limit", "20"])
             .output()
             .await
-            .map_err(|e| format!("gh pr list failed: {}", e))?;
+            .map_err(|e| format!("gh search prs failed: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) {
             for pr in prs {
                 let number = pr["number"].as_u64().unwrap_or(0);
+                // repository is nested: {name, nameWithOwner, ...}
+                let repo = pr["repository"]["nameWithOwner"].as_str().unwrap_or("").to_string();
+                if repo.is_empty() { continue; }
                 let id = format!("review_{}_{}", repo, number);
 
                 let mut seen_lock = seen.lock().await;
-                if seen_lock.contains(&id) {
-                    continue;
-                }
+                if seen_lock.contains(&id) { continue; }
                 seen_lock.insert(id.clone());
                 drop(seen_lock);
 
@@ -220,6 +226,46 @@ async fn poll_github(
                 println!("[Pawkit] Found review request: {} #{}", repo, number);
                 pending.lock().await.push(item.clone());
                 notify_review_item(app_handle, &item, slack, is_away).await;
+            }
+        }
+    } else {
+        // Specific repos: use gh pr list per repo
+        for repo in &config.repos {
+            let output = tokio::process::Command::new("cmd")
+                .args(["/C", "gh", "pr", "list",
+                    "--repo", repo,
+                    "--search", "review-requested:@me",
+                    "--json", "number,title,url",
+                    "--limit", "10"])
+                .output()
+                .await
+                .map_err(|e| format!("gh pr list failed: {}", e))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) {
+                for pr in prs {
+                    let number = pr["number"].as_u64().unwrap_or(0);
+                    let id = format!("review_{}_{}", repo, number);
+
+                    let mut seen_lock = seen.lock().await;
+                    if seen_lock.contains(&id) { continue; }
+                    seen_lock.insert(id.clone());
+                    drop(seen_lock);
+
+                    let item = ReviewItem {
+                        id,
+                        repo: repo.clone(),
+                        pr_number: number,
+                        title: pr["title"].as_str().unwrap_or("").to_string(),
+                        url: pr["url"].as_str().unwrap_or("").to_string(),
+                        item_type: "review_request".to_string(),
+                        body: String::new(),
+                    };
+
+                    println!("[Pawkit] Found review request: {} #{}", repo, number);
+                    pending.lock().await.push(item.clone());
+                    notify_review_item(app_handle, &item, slack, is_away).await;
+                }
             }
         }
     }
@@ -239,8 +285,8 @@ async fn poll_github(
             let repo = notif["repo"].as_str().unwrap_or("").to_string();
             let id = format!("mention_{}", notif_id);
 
-            // Only track repos we're configured to watch
-            if !config.repos.iter().any(|r| r == &repo) {
+            // Only track repos we're configured to watch (skip filter if repos list is empty = all repos)
+            if !config.repos.is_empty() && !config.repos.iter().any(|r| r == &repo) {
                 continue;
             }
 
