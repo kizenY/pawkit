@@ -125,7 +125,11 @@ pub struct SlackConfig {
     pub critical_tools: Vec<String>,
 }
 
-fn default_working_dir() -> String { "E:\\develop\\code".to_string() }
+fn default_working_dir() -> String {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| if cfg!(target_os = "windows") { "C:\\".to_string() } else { "/".to_string() })
+}
 fn default_poll_interval() -> u64 { 2000 }
 fn default_output_buffer() -> u64 { 1000 }
 
@@ -257,6 +261,9 @@ pub struct AutoReviewConfig {
     pub repos: Vec<String>,
     #[serde(default)]
     pub repo_dirs: HashMap<String, String>,
+    /// GitHub account to use (runs `gh auth switch -u <account>` before each poll)
+    #[serde(default)]
+    pub gh_account: Option<String>,
 }
 
 fn default_review_interval() -> u64 { 5 }
@@ -268,6 +275,7 @@ impl Default for AutoReviewConfig {
             interval_minutes: default_review_interval(),
             repos: Vec::new(),
             repo_dirs: HashMap::new(),
+            gh_account: None,
         }
     }
 }

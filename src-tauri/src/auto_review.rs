@@ -9,6 +9,21 @@ use std::time::Duration;
 use tauri::Emitter;
 use tokio::sync::{mpsc, Mutex};
 
+/// Create a Command that runs `gh` directly (no shell intermediary).
+fn gh_command(args: &[&str]) -> tokio::process::Command {
+    if cfg!(target_os = "windows") {
+        let mut cmd = tokio::process::Command::new("cmd");
+        let mut all = vec!["/C", "gh"];
+        all.extend_from_slice(args);
+        cmd.args(all);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("gh");
+        cmd.args(args);
+        cmd
+    }
+}
+
 /// A review item detected by the polling loop
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewItem {
@@ -187,11 +202,24 @@ async fn poll_github(
 ) -> Result<(), String> {
     println!("[Pawkit] Polling GitHub for review items...");
 
+    // Switch gh account if configured
+    if let Some(ref account) = config.gh_account {
+        match gh_command(&["auth", "switch", "-u", account]).output().await {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!("[Pawkit] Failed to switch gh account to '{}': {}", account, stderr.trim());
+            }
+            Err(e) => {
+                eprintln!("[Pawkit] Failed to run gh auth switch: {}", e);
+            }
+            _ => {}
+        }
+    }
+
     // 1. Check review requests
     if config.repos.is_empty() {
         // No repo filter: use gh search to find all PRs requesting review from @me
-        let output = tokio::process::Command::new("cmd")
-            .args(["/C", "gh", "search", "prs",
+        let output = gh_command(&["search", "prs",
                 "--review-requested=@me", "--state=open",
                 "--json", "number,title,url,repository",
                 "--limit", "20"])
@@ -231,8 +259,7 @@ async fn poll_github(
     } else {
         // Specific repos: use gh pr list per repo
         for repo in &config.repos {
-            let output = tokio::process::Command::new("cmd")
-                .args(["/C", "gh", "pr", "list",
+            let output = gh_command(&["pr", "list",
                     "--repo", repo,
                     "--search", "review-requested:@me",
                     "--json", "number,title,url",
@@ -271,8 +298,7 @@ async fn poll_github(
     }
 
     // 2. Check notifications for mentions
-    let output = tokio::process::Command::new("cmd")
-        .args(["/C", "gh", "api", "notifications",
+    let output = gh_command(&["api", "notifications",
             "--jq", "[.[] | select(.reason == \"mention\") | {id: .id, reason: .reason, title: .subject.title, url: .subject.url, repo: .repository.full_name}]"])
         .output()
         .await
@@ -298,10 +324,34 @@ async fn poll_github(
             drop(seen_lock);
 
             // Extract PR number from URL (e.g. .../pulls/123)
-            let url = notif["url"].as_str().unwrap_or("");
-            let pr_number = url.rsplit('/').next()
+            let api_url = notif["url"].as_str().unwrap_or("");
+            let pr_number = api_url.rsplit('/').next()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
+
+            // Skip merged/closed PRs
+            if pr_number > 0 {
+                let state_output = gh_command(&["pr", "view",
+                        &pr_number.to_string(), "--repo", &repo,
+                        "--json", "state", "--jq", ".state"])
+                    .output()
+                    .await;
+                if let Ok(o) = state_output {
+                    let state = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+                    if state == "merged" || state == "closed" {
+                        println!("[Pawkit] Skipping {} #{}: {}", repo, pr_number, state);
+                        continue;
+                    }
+                }
+            }
+
+            // Convert API URL to web URL
+            // api.github.com/repos/OWNER/REPO/pulls/N → github.com/OWNER/REPO/pull/N
+            let web_url = if pr_number > 0 {
+                format!("https://github.com/{}/pull/{}", repo, pr_number)
+            } else {
+                api_url.replace("api.github.com/repos", "github.com").replace("/pulls/", "/pull/")
+            };
 
             // Fetch the comment details
             let comment_body = fetch_latest_mention_comment(&repo, pr_number).await;
@@ -311,7 +361,7 @@ async fn poll_github(
                 repo: repo.clone(),
                 pr_number,
                 title: notif["title"].as_str().unwrap_or("").to_string(),
-                url: url.to_string(),
+                url: web_url,
                 item_type: "mention".to_string(),
                 body: comment_body,
             };
@@ -330,8 +380,7 @@ async fn fetch_latest_mention_comment(repo: &str, pr_number: u64) -> String {
     if pr_number == 0 { return String::new(); }
 
     let endpoint = format!("repos/{}/issues/{}/comments?per_page=5&direction=desc", repo, pr_number);
-    let output = tokio::process::Command::new("cmd")
-        .args(["/C", "gh", "api", &endpoint,
+    let output = gh_command(&["api", &endpoint,
             "--jq", ".[0].body // \"\""])
         .output()
         .await;
@@ -379,8 +428,7 @@ async fn process_approved_items(
                 // Mark notification as read
                 if item.item_type == "mention" {
                     let notif_id = item.id.strip_prefix("mention_").unwrap_or(&item.id);
-                    let _ = tokio::process::Command::new("cmd")
-                        .args(["/C", "gh", "api", "-X", "PATCH",
+                    let _ = gh_command(&["api", "-X", "PATCH",
                             &format!("notifications/threads/{}", notif_id)])
                         .output()
                         .await;
