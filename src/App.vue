@@ -46,8 +46,9 @@ async function onContextMenu(e: MouseEvent) {
 }
 
 function onClick() {
-  if (hasUnread.value) {
+  if (hasUnread.value || reviewBubble.value) {
     hasUnread.value = false;
+    reviewBubble.value = null;
   } else {
     playMeow();
   }

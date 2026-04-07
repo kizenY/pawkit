@@ -1,6 +1,7 @@
 use crate::claude_session::{ClaudeOutput, ClaudeSession};
 use crate::config::AutoReviewConfig;
 use crate::slack_bridge::SlackBridge;
+use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,25 +10,55 @@ use std::time::Duration;
 use tauri::Emitter;
 use tokio::sync::{mpsc, Mutex};
 
-/// Create a Command that runs `gh` directly (no shell intermediary).
-fn gh_command(args: &[&str]) -> tokio::process::Command {
+/// Build a reqwest client with GitHub API auth headers.
+/// Token is obtained from `gh auth token` at startup.
+async fn get_github_token(account: &Option<String>) -> Result<String, String> {
+    let mut args = vec!["auth", "token"];
+    let user_flag;
+    if let Some(ref acct) = account {
+        user_flag = acct.clone();
+        args.push("-u");
+        args.push(&user_flag);
+    }
+
     #[cfg(target_os = "windows")]
-    {
+    let output = {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let mut cmd = tokio::process::Command::new("cmd");
         let mut all = vec!["/C", "gh"];
-        all.extend_from_slice(args);
-        cmd.args(all);
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd
-    }
+        all.extend_from_slice(&args);
+        tokio::process::Command::new("cmd")
+            .args(all)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .await
+    };
     #[cfg(not(target_os = "windows"))]
-    {
-        let mut cmd = tokio::process::Command::new("gh");
-        cmd.args(args);
-        cmd
+    let output = {
+        tokio::process::Command::new("gh")
+            .args(&args)
+            .output()
+            .await
+    };
+
+    let output = output.map_err(|e| format!("Failed to run gh auth token: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("gh auth token failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn github_client(token: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
+    headers.insert(ACCEPT, "application/vnd.github+json".parse().unwrap());
+    headers.insert(USER_AGENT, "Pawkit".parse().unwrap());
+    headers.insert("X-GitHub-Api-Version", "2022-11-28".parse().unwrap());
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap()
 }
 
 /// A review item detected by the polling loop
@@ -81,13 +112,26 @@ pub fn start_auto_review(
     let poll_slack = slack.clone();
     let poll_away = is_away.clone();
     tauri::async_runtime::spawn(async move {
+        // Get GitHub token once at startup
+        let token = match get_github_token(&poll_config.gh_account).await {
+            Ok(t) => {
+                println!("[Pawkit] GitHub token acquired");
+                t
+            }
+            Err(e) => {
+                eprintln!("[Pawkit] Failed to get GitHub token: {}. Auto-review polling disabled.", e);
+                return;
+            }
+        };
+        let client = github_client(&token);
+
         let interval = Duration::from_secs(poll_config.interval_minutes * 60);
         // Initial short delay before first poll
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         loop {
             if let Err(e) = poll_github(
-                &poll_handle, &poll_config, &poll_seen, &poll_pending,
+                &client, &poll_handle, &poll_config, &poll_seen, &poll_pending,
                 &poll_slack, &poll_away,
             ).await {
                 eprintln!("[Pawkit] Auto-review poll error: {}", e);
@@ -197,8 +241,9 @@ async fn post_review_error_to_slack(
     )).await;
 }
 
-/// Poll GitHub for review requests and mentions
+/// Poll GitHub for review requests and mentions using the REST API directly.
 async fn poll_github(
+    client: &reqwest::Client,
     app_handle: &tauri::AppHandle,
     config: &AutoReviewConfig,
     seen: &SeenItems,
@@ -208,37 +253,28 @@ async fn poll_github(
 ) -> Result<(), String> {
     println!("[Pawkit] Polling GitHub for review items...");
 
-    // Switch gh account if configured
-    if let Some(ref account) = config.gh_account {
-        match gh_command(&["auth", "switch", "-u", account]).output().await {
-            Ok(o) if !o.status.success() => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                eprintln!("[Pawkit] Failed to switch gh account to '{}': {}", account, stderr.trim());
-            }
-            Err(e) => {
-                eprintln!("[Pawkit] Failed to run gh auth switch: {}", e);
-            }
-            _ => {}
-        }
-    }
-
     // 1. Check review requests
     if config.repos.is_empty() {
-        // No repo filter: use gh search to find all PRs requesting review from @me
-        let output = gh_command(&["search", "prs",
-                "--review-requested=@me", "--state=open",
-                "--json", "number,title,url,repository",
-                "--limit", "20"])
-            .output()
-            .await
-            .map_err(|e| format!("gh search prs failed: {}", e))?;
+        // No repo filter: search all PRs requesting review from @me
+        let resp = client
+            .get("https://api.github.com/search/issues")
+            .query(&[
+                ("q", "is:pr is:open review-requested:@me"),
+                ("per_page", "20"),
+            ])
+            .send().await
+            .map_err(|e| format!("GitHub search API failed: {}", e))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) {
-            for pr in prs {
-                let number = pr["number"].as_u64().unwrap_or(0);
-                // repository is nested: {name, nameWithOwner, ...}
-                let repo = pr["repository"]["nameWithOwner"].as_str().unwrap_or("").to_string();
+        let body: serde_json::Value = resp.json().await
+            .map_err(|e| format!("Failed to parse search response: {}", e))?;
+
+        if let Some(items) = body["items"].as_array() {
+            for item in items {
+                let number = item["number"].as_u64().unwrap_or(0);
+                // Extract repo from repository_url: https://api.github.com/repos/OWNER/REPO
+                let repo = item["repository_url"].as_str().unwrap_or("")
+                    .strip_prefix("https://api.github.com/repos/")
+                    .unwrap_or("").to_string();
                 if repo.is_empty() { continue; }
                 let id = format!("review_{}_{}", repo, number);
 
@@ -247,154 +283,181 @@ async fn poll_github(
                 seen_lock.insert(id.clone());
                 drop(seen_lock);
 
-                let item = ReviewItem {
+                let review_item = ReviewItem {
                     id,
                     repo: repo.clone(),
                     pr_number: number,
-                    title: pr["title"].as_str().unwrap_or("").to_string(),
-                    url: pr["url"].as_str().unwrap_or("").to_string(),
+                    title: item["title"].as_str().unwrap_or("").to_string(),
+                    url: item["html_url"].as_str().unwrap_or("").to_string(),
                     item_type: "review_request".to_string(),
                     body: String::new(),
                 };
 
                 println!("[Pawkit] Found review request: {} #{}", repo, number);
-                pending.lock().await.push(item.clone());
-                notify_review_item(app_handle, &item, slack, is_away).await;
+                pending.lock().await.push(review_item.clone());
+                notify_review_item(app_handle, &review_item, slack, is_away).await;
             }
         }
     } else {
-        // Specific repos: use gh pr list per repo
+        // Specific repos: search PRs requesting review from @me per repo
         for repo in &config.repos {
-            let output = gh_command(&["pr", "list",
-                    "--repo", repo,
-                    "--search", "review-requested:@me",
-                    "--json", "number,title,url",
-                    "--limit", "10"])
-                .output()
-                .await
-                .map_err(|e| format!("gh pr list failed: {}", e))?;
+            let query = format!("is:pr is:open review-requested:@me repo:{}", repo);
+            let resp = client
+                .get("https://api.github.com/search/issues")
+                .query(&[("q", query.as_str()), ("per_page", "10")])
+                .send().await;
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) {
-                for pr in prs {
-                    let number = pr["number"].as_u64().unwrap_or(0);
-                    let id = format!("review_{}_{}", repo, number);
-
-                    let mut seen_lock = seen.lock().await;
-                    if seen_lock.contains(&id) { continue; }
-                    seen_lock.insert(id.clone());
-                    drop(seen_lock);
-
-                    let item = ReviewItem {
-                        id,
-                        repo: repo.clone(),
-                        pr_number: number,
-                        title: pr["title"].as_str().unwrap_or("").to_string(),
-                        url: pr["url"].as_str().unwrap_or("").to_string(),
-                        item_type: "review_request".to_string(),
-                        body: String::new(),
-                    };
-
-                    println!("[Pawkit] Found review request: {} #{}", repo, number);
-                    pending.lock().await.push(item.clone());
-                    notify_review_item(app_handle, &item, slack, is_away).await;
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[Pawkit] Failed to search PRs for {}: {}", repo, e);
+                    continue;
                 }
+            };
+
+            let body: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let items = match body["items"].as_array() {
+                Some(a) => a,
+                None => continue,
+            };
+
+            for pr in items {
+                let number = pr["number"].as_u64().unwrap_or(0);
+                let id = format!("review_{}_{}", repo, number);
+
+                let mut seen_lock = seen.lock().await;
+                if seen_lock.contains(&id) { continue; }
+                seen_lock.insert(id.clone());
+                drop(seen_lock);
+
+                let review_item = ReviewItem {
+                    id,
+                    repo: repo.clone(),
+                    pr_number: number,
+                    title: pr["title"].as_str().unwrap_or("").to_string(),
+                    url: pr["html_url"].as_str().unwrap_or("").to_string(),
+                    item_type: "review_request".to_string(),
+                    body: String::new(),
+                };
+
+                println!("[Pawkit] Found review request: {} #{}", repo, number);
+                pending.lock().await.push(review_item.clone());
+                notify_review_item(app_handle, &review_item, slack, is_away).await;
             }
         }
     }
 
     // 2. Check notifications for mentions
-    let output = gh_command(&["api", "notifications",
-            "--jq", "[.[] | select(.reason == \"mention\") | {id: .id, reason: .reason, title: .subject.title, url: .subject.url, repo: .repository.full_name}]"])
-        .output()
-        .await
-        .map_err(|e| format!("gh api notifications failed: {}", e))?;
+    let resp = client
+        .get("https://api.github.com/notifications")
+        .query(&[("reason", "mention")])
+        .send().await
+        .map_err(|e| format!("GitHub notifications API failed: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Ok(notifications) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) {
-        for notif in notifications {
-            let notif_id = notif["id"].as_str().unwrap_or("").to_string();
-            let repo = notif["repo"].as_str().unwrap_or("").to_string();
-            let id = format!("mention_{}", notif_id);
+    let notifications: Vec<serde_json::Value> = resp.json().await
+        .map_err(|e| format!("Failed to parse notifications: {}", e))?;
 
-            // Only track repos we're configured to watch (skip filter if repos list is empty = all repos)
-            if !config.repos.is_empty() && !config.repos.iter().any(|r| r == &repo) {
-                continue;
-            }
+    for notif in notifications {
+        // The notifications API doesn't support reason filter as query param,
+        // so we filter client-side
+        if notif["reason"].as_str() != Some("mention") {
+            continue;
+        }
 
-            let mut seen_lock = seen.lock().await;
-            if seen_lock.contains(&id) {
-                continue;
-            }
-            seen_lock.insert(id.clone());
-            drop(seen_lock);
+        let notif_id = notif["id"].as_str().unwrap_or("").to_string();
+        let repo = notif["repository"]["full_name"].as_str().unwrap_or("").to_string();
+        let id = format!("mention_{}", notif_id);
 
-            // Extract PR number from URL (e.g. .../pulls/123)
-            let api_url = notif["url"].as_str().unwrap_or("");
-            let pr_number = api_url.rsplit('/').next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+        // Only track repos we're configured to watch (skip filter if repos list is empty = all repos)
+        if !config.repos.is_empty() && !config.repos.iter().any(|r| r == &repo) {
+            continue;
+        }
 
-            // Skip merged/closed PRs
-            if pr_number > 0 {
-                let state_output = gh_command(&["pr", "view",
-                        &pr_number.to_string(), "--repo", &repo,
-                        "--json", "state", "--jq", ".state"])
-                    .output()
-                    .await;
-                if let Ok(o) = state_output {
-                    let state = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
-                    if state == "merged" || state == "closed" {
-                        println!("[Pawkit] Skipping {} #{}: {}", repo, pr_number, state);
+        let mut seen_lock = seen.lock().await;
+        if seen_lock.contains(&id) { continue; }
+        seen_lock.insert(id.clone());
+        drop(seen_lock);
+
+        // Extract PR number from subject URL (e.g. .../pulls/123)
+        let api_url = notif["subject"]["url"].as_str().unwrap_or("");
+        let pr_number = api_url.rsplit('/').next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // Skip merged/closed PRs
+        if pr_number > 0 && !repo.is_empty() {
+            let pr_url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+            if let Ok(pr_resp) = client.get(&pr_url).send().await {
+                if let Ok(pr_data) = pr_resp.json::<serde_json::Value>().await {
+                    let state = pr_data["state"].as_str().unwrap_or("");
+                    let merged = pr_data["merged"].as_bool().unwrap_or(false);
+                    if state == "closed" || merged {
+                        println!("[Pawkit] Skipping {} #{}: {}", repo, pr_number,
+                            if merged { "merged" } else { "closed" });
                         continue;
                     }
                 }
             }
-
-            // Convert API URL to web URL
-            // api.github.com/repos/OWNER/REPO/pulls/N → github.com/OWNER/REPO/pull/N
-            let web_url = if pr_number > 0 {
-                format!("https://github.com/{}/pull/{}", repo, pr_number)
-            } else {
-                api_url.replace("api.github.com/repos", "github.com").replace("/pulls/", "/pull/")
-            };
-
-            // Fetch the comment details
-            let comment_body = fetch_latest_mention_comment(&repo, pr_number).await;
-
-            let item = ReviewItem {
-                id,
-                repo: repo.clone(),
-                pr_number,
-                title: notif["title"].as_str().unwrap_or("").to_string(),
-                url: web_url,
-                item_type: "mention".to_string(),
-                body: comment_body,
-            };
-
-            println!("[Pawkit] Found mention: {} #{}", repo, pr_number);
-            pending.lock().await.push(item.clone());
-            notify_review_item(app_handle, &item, slack, is_away).await;
         }
+
+        // Convert API URL to web URL
+        let web_url = if pr_number > 0 && !repo.is_empty() {
+            format!("https://github.com/{}/pull/{}", repo, pr_number)
+        } else {
+            api_url.replace("api.github.com/repos", "github.com").replace("/pulls/", "/pull/")
+        };
+
+        // Fetch the latest comment
+        let comment_body = fetch_latest_mention_comment(client, &repo, pr_number).await;
+
+        let item = ReviewItem {
+            id,
+            repo: repo.clone(),
+            pr_number,
+            title: notif["subject"]["title"].as_str().unwrap_or("").to_string(),
+            url: web_url,
+            item_type: "mention".to_string(),
+            body: comment_body,
+        };
+
+        println!("[Pawkit] Found mention: {} #{}", repo, pr_number);
+        pending.lock().await.push(item.clone());
+        notify_review_item(app_handle, &item, slack, is_away).await;
     }
 
     Ok(())
 }
 
-/// Fetch the latest comment mentioning the user on a PR
-async fn fetch_latest_mention_comment(repo: &str, pr_number: u64) -> String {
-    if pr_number == 0 { return String::new(); }
+/// Fetch the latest comment on a PR/issue
+async fn fetch_latest_mention_comment(client: &reqwest::Client, repo: &str, pr_number: u64) -> String {
+    if pr_number == 0 || repo.is_empty() { return String::new(); }
 
-    let endpoint = format!("repos/{}/issues/{}/comments?per_page=5&direction=desc", repo, pr_number);
-    let output = gh_command(&["api", &endpoint,
-            "--jq", ".[0].body // \"\""])
-        .output()
-        .await;
+    let url = format!(
+        "https://api.github.com/repos/{}/issues/{}/comments?per_page=5&direction=desc",
+        repo, pr_number
+    );
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    let comments: Vec<serde_json::Value> = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    comments.first()
+        .and_then(|c| c["body"].as_str())
+        .unwrap_or("")
+        .to_string()
+}
 
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Err(_) => String::new(),
-    }
+/// Mark a notification thread as read
+async fn mark_notification_read(client: &reqwest::Client, thread_id: &str) {
+    let url = format!("https://api.github.com/notifications/threads/{}", thread_id);
+    let _ = client.patch(&url).send().await;
 }
 
 /// Process approved review items using Claude Code
@@ -405,6 +468,12 @@ async fn process_approved_items(
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
 ) {
+    // Get a client for marking notifications read
+    let client = match get_github_token(&config.gh_account).await {
+        Ok(token) => Some(github_client(&token)),
+        Err(_) => None,
+    };
+
     while let Some(item) = rx.recv().await {
         println!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
 
@@ -433,11 +502,10 @@ async fn process_approved_items(
 
                 // Mark notification as read
                 if item.item_type == "mention" {
-                    let notif_id = item.id.strip_prefix("mention_").unwrap_or(&item.id);
-                    let _ = gh_command(&["api", "-X", "PATCH",
-                            &format!("notifications/threads/{}", notif_id)])
-                        .output()
-                        .await;
+                    if let Some(ref c) = client {
+                        let notif_id = item.id.strip_prefix("mention_").unwrap_or(&item.id);
+                        mark_notification_read(c, notif_id).await;
+                    }
                 }
 
                 let _ = app_handle.emit("review_item_done", &item.id);
