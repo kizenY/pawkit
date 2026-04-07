@@ -5,6 +5,9 @@
 enabled: true
 interval_minutes: 5
 
+# GitHub account to use (for multi-account setups)
+# gh_account: your-github-username
+
 # Repos to watch for review requests
 repos:
   - SeesawTech/seesaw-main
