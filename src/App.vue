@@ -8,7 +8,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import meowSound from "./assets/sounds/meow.mp3";
 import bellSound from "./assets/sounds/bell.mp3";
 
-const petState = ref<"idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away">("idle");
+const petState = ref<"idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away" | "knock">("idle");
 const authActive = ref(false);
 const isAway = ref(false);
 const hasUnread = ref(false);
@@ -18,6 +18,7 @@ let unlistenFinished: UnlistenFn | null = null;
 let unlistenAuth: UnlistenFn | null = null;
 let unlistenMode: UnlistenFn | null = null;
 let unlistenTaskDone: UnlistenFn | null = null;
+let unlistenKnock: UnlistenFn | null = null;
 let unlistenTerminalFocused: UnlistenFn | null = null;
 let unlistenClaudeActive: UnlistenFn | null = null;
 let claudeIdleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -46,7 +47,7 @@ async function onContextMenu(e: MouseEvent) {
 }
 
 function onClick() {
-  if (hasUnread.value || reviewBubble.value || petState.value === "success") {
+  if (hasUnread.value || reviewBubble.value || petState.value === "success" || petState.value === "knock") {
     hasUnread.value = false;
     reviewBubble.value = null;
     petState.value = "idle";
@@ -117,6 +118,14 @@ onMounted(async () => {
     hasUnread.value = true;
     playBell();
   });
+  // Claude Code notification (permission, idle, auth) — knock knock
+  unlistenKnock = await listen("claude_knock", () => {
+    if (isAway.value) return;
+    if (claudeIdleTimer) clearTimeout(claudeIdleTimer);
+    petState.value = "knock";
+    hasUnread.value = true;
+    playBell();
+  });
   // User switched to Claude terminal directly — clear unread
   unlistenTerminalFocused = await listen("terminal_focused", () => {
     hasUnread.value = false;
@@ -143,6 +152,7 @@ onUnmounted(() => {
   unlistenAuth?.();
   unlistenMode?.();
   unlistenTaskDone?.();
+  unlistenKnock?.();
   unlistenTerminalFocused?.();
   unlistenClaudeActive?.();
 });

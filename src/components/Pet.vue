@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 const emit = defineEmits<{ (e: "pet-click"): void }>();
 
 const props = defineProps<{
-  state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away";
+  state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away" | "knock";
   showBell?: boolean;
   reviewBubble?: "reviewing" | "done" | null;
 }>();
@@ -21,6 +21,7 @@ const spriteMap: Record<string, string> = {
   fail: "/fail.gif",
   sleep: "/cat.png",
   waiting_auth: "/question.gif",
+  knock: "/question.gif",
   away: "/cat.png",
 };
 

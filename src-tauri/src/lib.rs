@@ -335,7 +335,6 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
                     *config = new_config;
                 }
                 let _ = app_handle.emit("config_changed", ());
-                plog!("[Pawkit] Config reloaded");
             }
         }
     });

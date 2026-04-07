@@ -275,7 +275,7 @@ async fn handle_notification(
         }
     }
 
-    let _ = state.app_handle.emit("claude_task_done", ());
+    let _ = state.app_handle.emit("claude_knock", ());
     StatusCode::OK
 }
 
@@ -401,6 +401,19 @@ async fn handle_pre_tool_use(
     make_decision_response(decision)
 }
 
+/// Handle Stop — Claude finished responding
+async fn handle_stop(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> StatusCode {
+    plog!("[Pawkit] Stop hook fired");
+    if state.is_away.load(Ordering::SeqCst) {
+        return StatusCode::OK;
+    }
+    let _ = state.app_handle.emit("claude_task_done", ());
+    StatusCode::OK
+}
+
 /// Handle UserPromptSubmit — user just pressed enter, Claude starts thinking
 async fn handle_user_prompt(
     State(state): State<AppState>,
@@ -447,6 +460,7 @@ pub fn start_hook_server(
     let app = Router::new()
         .route("/hook/pre-tool-use", post(handle_pre_tool_use))
         .route("/hook/notification", post(handle_notification))
+        .route("/hook/stop", post(handle_stop))
         .route("/hook/user-prompt", post(handle_user_prompt))
         .route("/hook/test-emit", post(handle_test_emit))
         .with_state(state);
