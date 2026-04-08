@@ -53,12 +53,15 @@ type ExecResult = Result<(String, String, Option<i32>), String>;
 fn execute_shell(action: &Action) -> ExecResult {
     let command = action.command.as_deref().ok_or("Missing 'command' field")?;
 
-    let mut cmd = if cfg!(target_os = "windows") {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
         use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
         c.raw_arg(format!("/C {}", command));
         c
-    } else {
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
         let mut c = Command::new("/bin/sh");
         c.args(["-c", command]);
         c
@@ -238,12 +241,11 @@ fn execute_claude(action: &Action) -> ExecResult {
         ));
     }
 
-    if cfg!(target_os = "windows") {
+    #[cfg(target_os = "windows")]
+    {
         let bash_path = find_git_bash()
             .ok_or("Cannot find git-bash. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")?;
 
-        // Use cmd to set CLAUDE_CODE_GIT_BASH_PATH so claude can find git-bash,
-        // then launch claude. /k keeps the window open after claude exits.
         use std::os::windows::process::CommandExt;
         let mut cmd = Command::new("cmd");
         cmd.raw_arg(format!(
@@ -251,8 +253,10 @@ fn execute_claude(action: &Action) -> ExecResult {
             workdir = workdir,
             bash = bash_path,
         ));
-        run_command(cmd)
-    } else if cfg!(target_os = "macos") {
+        return run_command(cmd);
+    }
+    #[cfg(target_os = "macos")]
+    {
         let script = format!(
             r#"tell application "Terminal"
                 activate
@@ -262,8 +266,10 @@ fn execute_claude(action: &Action) -> ExecResult {
         );
         let mut cmd = Command::new("osascript");
         cmd.args(["-e", &script]);
-        run_command(cmd)
-    } else {
+        return run_command(cmd);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
         // Linux: try common terminal emulators
         let mut cmd = Command::new("bash");
         cmd.args(["-c", &format!(
