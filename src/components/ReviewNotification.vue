@@ -22,6 +22,7 @@ const processing = ref(false);
 const processingItem = ref<ReviewItem | null>(null);
 const doneItem = ref<ReviewItem | null>(null);
 const doneError = ref<string | null>(null);
+const doneMerged = ref(false);
 let unlistenFound: UnlistenFn | null = null;
 let unlistenDone: UnlistenFn | null = null;
 let unlistenError: UnlistenFn | null = null;
@@ -70,6 +71,7 @@ function dismissDone() {
   doneTimer = null;
   doneItem.value = null;
   doneError.value = null;
+  doneMerged.value = false;
   emit("reviewBubble", null);
   processQueue();
 }
@@ -79,10 +81,11 @@ onMounted(async () => {
     queue.value.push(event.payload);
     processQueue();
   });
-  unlistenDone = await listen<string>("review_item_done", () => {
+  unlistenDone = await listen<{id: string, merged: boolean}>("review_item_done", (event) => {
     processing.value = false;
     doneItem.value = processingItem.value;
     doneError.value = null;
+    doneMerged.value = event.payload?.merged || false;
     processingItem.value = null;
     emit("reviewBubble", "done");
     if (doneTimer) clearTimeout(doneTimer);
@@ -110,8 +113,8 @@ onUnmounted(() => {
   <!-- Result card: shown after review completes -->
   <Transition name="slide-review">
     <div v-if="doneItem" class="review-card" @mousedown.prevent @click="dismissDone">
-      <div class="review-type" :style="{ color: doneError ? '#ff6b6b' : '#6bff6b' }">
-        {{ doneError ? "Failed" : doneItem.is_own_pr ? "Feedback Done" : "Review Done" }}
+      <div class="review-type" :style="{ color: doneError ? '#ff6b6b' : doneMerged ? '#ffd700' : '#6bff6b' }">
+        {{ doneError ? "Failed" : doneMerged ? "Merged!" : doneItem.is_own_pr ? "Feedback Done" : "Review Done" }}
       </div>
       <div class="review-title">
         {{ doneItem.repo.split("/")[1] }}#{{ doneItem.pr_number }}

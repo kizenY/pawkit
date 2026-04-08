@@ -470,6 +470,47 @@ pub async fn mark_notification_read_by_id(thread_id: &str) {
     mark_notification_read(&client, thread_id).await;
 }
 
+/// Try to merge a PR if it's in a mergeable state (all checks pass, approved, no conflicts).
+/// Returns Ok(true) if merged, Ok(false) if not mergeable, Err on API failure.
+async fn try_merge_pr(
+    client: &reqwest::Client,
+    repo: &str,
+    pr_number: u64,
+) -> Result<bool, String> {
+    let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+    let resp = client.get(&url).send().await
+        .map_err(|e| format!("Failed to fetch PR: {}", e))?;
+    let pr: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse PR: {}", e))?;
+
+    let mergeable = pr["mergeable"].as_bool();
+    let state = pr["mergeable_state"].as_str().unwrap_or("");
+
+    if mergeable != Some(true) || state != "clean" {
+        plog!("[Pawkit] PR {} #{} not mergeable (mergeable={:?}, state={})",
+            repo, pr_number, mergeable, state);
+        return Ok(false);
+    }
+
+    let title = pr["title"].as_str().unwrap_or("");
+    let merge_url = format!("https://api.github.com/repos/{}/pulls/{}/merge", repo, pr_number);
+    let resp = client.put(&merge_url)
+        .json(&serde_json::json!({
+            "commit_title": format!("{} (#{})", title, pr_number),
+            "merge_method": "squash"
+        }))
+        .send().await
+        .map_err(|e| format!("Merge API failed: {}", e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        Ok(true)
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("Merge failed ({}): {}", status, body))
+    }
+}
+
 /// Process approved review items using Claude Code
 async fn process_approved_items(
     mut rx: ApprovedRx,
@@ -505,12 +546,35 @@ async fn process_approved_items(
                 // Post result to Slack in away mode
                 post_review_result_to_slack(slack, is_away, &item, &output).await;
 
+                // Try to auto-merge if the PR is in a mergeable state
+                let merged = match try_merge_pr(client, &item.repo, item.pr_number).await {
+                    Ok(true) => {
+                        plog!("[Pawkit] Auto-merged {} #{}", item.repo, item.pr_number);
+                        if is_away.load(Ordering::SeqCst) {
+                            if let Some(ref s) = slack {
+                                let _ = s.reply(&format!(
+                                    "🎉 *Auto-merged*: `{}` #{}", item.repo, item.pr_number
+                                )).await;
+                            }
+                        }
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(e) => {
+                        plog!("[Pawkit] Auto-merge failed for {} #{}: {}", item.repo, item.pr_number, e);
+                        false
+                    }
+                };
+
                 // Mark notification as read only on success
                 if !item.notification_id.is_empty() {
                     mark_notification_read(client, &item.notification_id).await;
                 }
 
-                let _ = app_handle.emit("review_item_done", &item.id);
+                let _ = app_handle.emit("review_item_done", &serde_json::json!({
+                    "id": item.id,
+                    "merged": merged,
+                }));
             }
             Err(e) => {
                 plog!("[Pawkit] Review failed for {} #{}: {}", item.repo, item.pr_number, e);
