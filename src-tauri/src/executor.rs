@@ -22,6 +22,7 @@ pub fn execute_action(action: &Action) -> ActionResult {
         "url" => execute_url(action),
         "http" => execute_http(action),
         "pipeline" => execute_pipeline(action),
+        "claude" => execute_claude(action),
         _ => Err(format!("Unknown action type: {}", action.action_type)),
     };
 
@@ -53,8 +54,9 @@ fn execute_shell(action: &Action) -> ExecResult {
     let command = action.command.as_deref().ok_or("Missing 'command' field")?;
 
     let mut cmd = if cfg!(target_os = "windows") {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
-        c.args(["/C", command]);
+        c.raw_arg(format!("/C {}", command));
         c
     } else {
         let mut c = Command::new("/bin/sh");
@@ -213,6 +215,99 @@ fn execute_pipeline(action: &Action) -> ExecResult {
     }
 
     Ok((all_stdout.join("\n"), all_stderr.join("\n"), final_exit_code))
+}
+
+fn execute_claude(action: &Action) -> ExecResult {
+    let workdir = action.workdir.as_deref()
+        .map(|w| resolve_env_vars(w))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+
+    if cfg!(target_os = "windows") {
+        let bash_path = find_git_bash()
+            .ok_or("Cannot find git-bash. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")?;
+
+        // Use cmd to set CLAUDE_CODE_GIT_BASH_PATH so claude can find git-bash,
+        // then launch claude. /k keeps the window open after claude exits.
+        use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new("cmd");
+        cmd.raw_arg(format!(
+            r#"/C start "" wt -d "{workdir}" cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
+            workdir = workdir,
+            bash = bash_path,
+        ));
+        run_command(cmd)
+    } else if cfg!(target_os = "macos") {
+        let script = format!(
+            r#"tell application "Terminal"
+                activate
+                do script "cd '{}' && claude"
+            end tell"#,
+            workdir
+        );
+        let mut cmd = Command::new("osascript");
+        cmd.args(["-e", &script]);
+        run_command(cmd)
+    } else {
+        // Linux: try common terminal emulators
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", &format!(
+            r#"cd '{}' && x-terminal-emulator -e bash -lic claude 2>/dev/null || gnome-terminal -- bash -lic claude 2>/dev/null || konsole -e bash -lic claude 2>/dev/null || xterm -e bash -lic claude"#,
+            workdir
+        )]);
+        run_command(cmd)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_git_bash() -> Option<String> {
+    use std::path::Path;
+
+    // 1. Check CLAUDE_CODE_GIT_BASH_PATH env var
+    if let Ok(path) = std::env::var("CLAUDE_CODE_GIT_BASH_PATH") {
+        if Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+
+    // 2. Check PATH — prefer Git-bundled bash over WSL/store aliases
+    if let Ok(output) = Command::new("where").arg("bash").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let path = line.trim();
+                // Skip WSL and Windows Store bash
+                if path.contains(r"\Windows\") || path.contains("WindowsApps") {
+                    continue;
+                }
+                if Path::new(path).exists() {
+                    return Some(path.to_string());
+                }
+            }
+        }
+    }
+
+    // 3. Check common locations
+    let candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ];
+    for candidate in &candidates {
+        if Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_git_bash() -> Option<String> {
+    Some("bash".to_string())
 }
 
 fn run_command(mut cmd: Command) -> ExecResult {

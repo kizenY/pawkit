@@ -140,33 +140,32 @@ pub struct AppConfig {
 }
 
 pub fn get_config_dir() -> PathBuf {
-    // Try relative to the executable first (works for both dev and production)
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            // In dev mode, exe is in src-tauri/target/debug, config is at project root
-            // Walk up to find config/ directory
-            let mut dir = exe_dir.to_path_buf();
-            for _ in 0..5 {
-                let config_candidate = dir.join("config");
-                if config_candidate.exists() {
-                    return config_candidate;
-                }
-                if let Some(parent) = dir.parent() {
-                    dir = parent.to_path_buf();
-                } else {
-                    break;
+    // Dev mode: use project config/ directory (exe is in src-tauri/target/debug)
+    if cfg!(debug_assertions) {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let mut dir = exe_dir.to_path_buf();
+                for _ in 0..5 {
+                    let config_candidate = dir.join("config");
+                    if config_candidate.exists() {
+                        return config_candidate;
+                    }
+                    if let Some(parent) = dir.parent() {
+                        dir = parent.to_path_buf();
+                    } else {
+                        break;
+                    }
                 }
             }
         }
+
+        let cwd_config = PathBuf::from("config");
+        if cwd_config.exists() {
+            return cwd_config;
+        }
     }
 
-    // Try current working directory
-    let cwd_config = PathBuf::from("config");
-    if cwd_config.exists() {
-        return cwd_config;
-    }
-
-    // Fallback: user config directory
+    // Production: always use user config directory (%APPDATA%/pawkit)
     if let Some(config_dir) = dirs::config_dir() {
         let app_config = config_dir.join("pawkit");
         if !app_config.exists() {
@@ -175,7 +174,40 @@ pub fn get_config_dir() -> PathBuf {
         return app_config;
     }
 
-    cwd_config
+    PathBuf::from("config")
+}
+
+/// Copy bundled default configs to user config dir on first launch.
+/// Only copies files that don't already exist (never overwrites user config).
+pub fn seed_default_configs() {
+    if cfg!(debug_assertions) {
+        return; // Dev mode uses project config/ directly
+    }
+
+    let config_dir = get_config_dir();
+
+    // Find bundled defaults next to the executable
+    let defaults_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("config-defaults")));
+
+    let defaults_dir = match defaults_dir {
+        Some(d) if d.exists() => d,
+        _ => return,
+    };
+
+    let defaults = ["actions.yaml", "pet.yaml", "auto_review.yaml"];
+    for filename in &defaults {
+        let target = config_dir.join(filename);
+        if !target.exists() {
+            let source = defaults_dir.join(filename);
+            if source.exists() {
+                if let Err(e) = fs::copy(&source, &target) {
+                    eprintln!("Failed to seed default config {}: {}", filename, e);
+                }
+            }
+        }
+    }
 }
 
 pub fn load_actions(config_dir: &PathBuf) -> ActionsConfig {

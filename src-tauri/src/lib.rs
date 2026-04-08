@@ -364,6 +364,7 @@ pub fn run() {
     logger::init();
     plog!("Pawkit starting...");
 
+    config::seed_default_configs();
     let initial_config = config::load_all_config();
     let shared_config: SharedConfig = Arc::new(Mutex::new(initial_config));
     let pending_requests: PendingRequests =
