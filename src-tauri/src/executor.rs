@@ -229,7 +229,8 @@ fn execute_claude(action: &Action) -> ExecResult {
     // Validate workdir to prevent command injection — reject characters that
     // could break out of shell quoting on any platform.
     if workdir.contains('"') || workdir.contains('\'') || workdir.contains('`')
-        || workdir.contains('$') || workdir.contains('\\') && cfg!(not(target_os = "windows"))
+        || workdir.contains('$')
+        || (workdir.contains('\\') && cfg!(not(target_os = "windows")))
     {
         return Err(format!(
             "Workdir contains unsafe characters (quotes, backticks, or $): {}",
