@@ -51,15 +51,15 @@ async fn get_github_token(account: &Option<String>) -> Result<String, String> {
 
 fn github_client(token: &str) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
-    headers.insert(ACCEPT, "application/vnd.github+json".parse().unwrap());
-    headers.insert(USER_AGENT, "Pawkit".parse().unwrap());
-    headers.insert("X-GitHub-Api-Version", "2022-11-28".parse().unwrap());
+    headers.insert(AUTHORIZATION, format!("Bearer {}", token).parse().expect("valid auth header"));
+    headers.insert(ACCEPT, "application/vnd.github+json".parse().expect("valid accept header"));
+    headers.insert(USER_AGENT, "Pawkit".parse().expect("valid user-agent header"));
+    headers.insert("X-GitHub-Api-Version", "2022-11-28".parse().expect("valid api-version header"));
     reqwest::Client::builder()
         .default_headers(headers)
         .timeout(Duration::from_secs(30))
         .build()
-        .unwrap()
+        .expect("failed to build reqwest client")
 }
 
 /// A review item detected by the polling loop
@@ -105,13 +105,17 @@ pub fn start_auto_review(
     let (approved_tx, approved_rx) = mpsc::channel::<ReviewItem>(32);
     let seen: SeenItems = Arc::new(Mutex::new(HashSet::new()));
 
-    // Task 1: Poll GitHub for review requests and mentions
+    // Get GitHub token once and share client across both tasks
     let poll_handle = app_handle.clone();
     let poll_config = config.clone();
     let poll_seen = seen.clone();
     let poll_pending = pending_items.clone();
     let poll_slack = slack.clone();
     let poll_away = is_away.clone();
+    let proc_config = config.clone();
+    let proc_handle = app_handle.clone();
+    let proc_slack = slack.clone();
+    let proc_away = is_away.clone();
     tauri::async_runtime::spawn(async move {
         // Get GitHub token once at startup
         let token = match get_github_token(&poll_config.gh_account).await {
@@ -125,29 +129,27 @@ pub fn start_auto_review(
             }
         };
         let client = github_client(&token);
+        let client2 = client.clone();
 
-        let interval = Duration::from_secs(poll_config.interval_minutes * 60);
-        // Initial short delay before first poll
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Task 1: Poll GitHub for review requests and mentions
+        tauri::async_runtime::spawn(async move {
+            let interval = Duration::from_secs(poll_config.interval_minutes * 60);
+            // Initial short delay before first poll
+            tokio::time::sleep(Duration::from_secs(10)).await;
 
-        loop {
-            if let Err(e) = poll_github(
-                &client, &poll_handle, &poll_config, &poll_seen, &poll_pending,
-                &poll_slack, &poll_away,
-            ).await {
-                plog!("[Pawkit] Auto-review poll error: {}", e);
+            loop {
+                if let Err(e) = poll_github(
+                    &client, &poll_handle, &poll_config, &poll_seen, &poll_pending,
+                    &poll_slack, &poll_away,
+                ).await {
+                    plog!("[Pawkit] Auto-review poll error: {}", e);
+                }
+                tokio::time::sleep(interval).await;
             }
-            tokio::time::sleep(interval).await;
-        }
-    });
+        });
 
-    // Task 2: Process approved items with Claude Code
-    let proc_config = config.clone();
-    let proc_handle = app_handle.clone();
-    let proc_slack = slack.clone();
-    let proc_away = is_away.clone();
-    tauri::async_runtime::spawn(async move {
-        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away).await;
+        // Task 2: Process approved items with Claude Code
+        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away, &client2).await;
     });
 
     // Store the sender so approved items can be sent from the Tauri command
@@ -470,7 +472,9 @@ async fn fetch_latest_mention_comment(client: &reqwest::Client, repo: &str, pr_n
 /// Mark a notification thread as read
 async fn mark_notification_read(client: &reqwest::Client, thread_id: &str) {
     let url = format!("https://api.github.com/notifications/threads/{}", thread_id);
-    let _ = client.patch(&url).send().await;
+    if let Err(e) = client.patch(&url).send().await {
+        plog!("[Pawkit] Failed to mark notification {} as read: {}", thread_id, e);
+    }
 }
 
 /// Process approved review items using Claude Code
@@ -480,12 +484,8 @@ async fn process_approved_items(
     app_handle: &tauri::AppHandle,
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
+    client: &reqwest::Client,
 ) {
-    // Get a client for marking notifications read
-    let client = match get_github_token(&config.gh_account).await {
-        Ok(token) => Some(github_client(&token)),
-        Err(_) => None,
-    };
 
     while let Some(item) = rx.recv().await {
         plog!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
@@ -515,11 +515,9 @@ async fn process_approved_items(
 
                 // Mark notification as read
                 if item.item_type == "mention" || item.item_type == "comment" {
-                    if let Some(ref c) = client {
-                        let prefix = format!("{}_", item.item_type);
-                        let notif_id = item.id.strip_prefix(&prefix).unwrap_or(&item.id);
-                        mark_notification_read(c, notif_id).await;
-                    }
+                    let prefix = format!("{}_", item.item_type);
+                    let notif_id = item.id.strip_prefix(&prefix).unwrap_or(&item.id);
+                    mark_notification_read(client, notif_id).await;
                 }
 
                 let _ = app_handle.emit("review_item_done", &item.id);

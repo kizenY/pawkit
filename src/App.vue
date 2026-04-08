@@ -159,7 +159,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app" @contextmenu="onContextMenu" @mousedown="onClick">
+  <div class="app" @contextmenu="onContextMenu">
     <Pet :state="petState" :show-bell="hasUnread" :review-bubble="reviewBubble" @pet-click="onClick" />
     <AuthNotification v-if="!isAway" @auth-active="onAuthActive" />
     <ReviewNotification v-if="!isAway && !authActive" @review-active="onReviewActive" @review-bubble="(s: any) => reviewBubble = s" />
