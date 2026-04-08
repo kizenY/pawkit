@@ -21,7 +21,8 @@ pawkit/
 │   └── SPRITES.md         # Sprite assets and animation system
 ├── src-tauri/             # Rust backend
 │   ├── src/
-│   │   ├── main.rs        # Tauri app entry point
+│   │   ├── main.rs        # Entry point: CLI subcommands or GUI launch
+│   │   ├── cli.rs         # CLI mode (list, run <action-id>)
 │   │   ├── executor.rs    # Runs shell/http/pipeline actions
 │   │   ├── config.rs      # YAML config read/write + file watcher
 │   │   ├── tray.rs        # System tray icon and menu
@@ -66,6 +67,16 @@ pnpm tauri build
 ```bash
 pnpm install
 pnpm tauri dev
+```
+
+### CLI Mode
+The binary supports CLI subcommands without launching the GUI:
+```bash
+pawkit list                    # List all available actions
+pawkit list -g "Deploy"        # Filter by group
+pawkit run <action-id>         # Execute an action
+pawkit run <action-id> -y      # Skip confirmation prompt
+pawkit                         # No subcommand → launch GUI as usual
 ```
 
 ## Important Conventions

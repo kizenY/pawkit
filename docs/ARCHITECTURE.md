@@ -47,7 +47,8 @@ Pawkit is a Tauri v2 desktop application with a transparent, borderless, always-
 | `executor.rs` | Executes actions by type. `shell`: spawns child process. `url`: opens default browser. `http`: sends HTTP request via `reqwest`. `pipeline`: runs steps sequentially, stops on failure. |
 | `tray.rs` | Creates system tray icon with basic menu (Show/Hide, Quit). |
 | `notifier.rs` | Sends Windows Toast notifications on action completion. Abstracts platform differences behind a trait for future macOS/Linux support. |
-| `main.rs` | Tauri app setup. Registers IPC commands, initializes config watcher, creates tray. |
+| `main.rs` | Entry point. Parses CLI args via `clap`: if a subcommand is given (`list`, `run`), runs in CLI mode; otherwise launches Tauri GUI. |
+| `cli.rs` | CLI mode. `list` prints actions (with optional group filter). `run <id>` executes an action, respecting `confirm` (interactive prompt, skippable with `-y`). Reuses `config.rs` and `executor.rs`. |
 
 ## IPC Commands (Tauri invoke)
 
@@ -79,6 +80,7 @@ File paths use the `dirs` crate (`dirs::config_dir()`) to resolve `~/.config/paw
 
 ## Data Flow: Action Execution
 
+### GUI Mode
 ```
 1. User right-clicks pet → ContextMenu shows
 2. User clicks "发版" → invoke("run_action", { id: "release" })
@@ -88,4 +90,14 @@ File paths use the `dirs` crate (`dirs::config_dir()`) to resolve `~/.config/paw
 6. Pet.vue switches to "success"/"fail" animation
 7. notifier.rs shows Windows Toast notification
 8. stdout/stderr logged to ~/.pawkit/logs/
+```
+
+### CLI Mode
+```
+1. User runs: pawkit run release
+2. cli.rs loads config/actions.yaml, finds action by ID
+3. If confirm: true → interactive prompt (skipped with -y flag)
+4. executor.rs executes the action (same code path as GUI)
+5. stdout/stderr printed to terminal
+6. Process exits with the action's exit code
 ```

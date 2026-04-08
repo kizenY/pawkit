@@ -1,4 +1,5 @@
 mod auto_review;
+pub mod cli;
 mod config;
 mod executor;
 mod hook_server;
