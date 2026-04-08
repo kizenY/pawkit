@@ -143,7 +143,14 @@ async fn skip_review_item(
 ) -> Result<bool, String> {
     let mut items = pending_reviews.lock().await;
     if let Some(pos) = items.iter().position(|i| i.id == id) {
-        items.remove(pos);
+        let item = items.remove(pos);
+        // Mark notification as read on skip
+        if !item.notification_id.is_empty() {
+            let notif_id = item.notification_id.clone();
+            tauri::async_runtime::spawn(async move {
+                auto_review::mark_notification_read_by_id(&notif_id).await;
+            });
+        }
         return Ok(true);
     }
     Ok(false)
@@ -157,6 +164,14 @@ fn get_hook_port() -> u16 {
 #[tauri::command]
 fn focus_claude_terminal() -> bool {
     win_focus::focus_claude_window()
+}
+
+#[tauri::command]
+async fn trigger_check_pr(
+    trigger: tauri::State<'_, auto_review::ManualPollTrigger>,
+) -> Result<bool, String> {
+    trigger.notify_one();
+    Ok(true)
 }
 
 #[tauri::command]
@@ -196,6 +211,10 @@ async fn show_context_menu(
             .map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&away_item);
     }
+    let check_pr_item = MenuItemBuilder::with_id("_pawkit_check_pr", "🔍 Check PR")
+        .build(app)
+        .map_err(|e| e.to_string())?;
+    menu_builder = menu_builder.item(&check_pr_item);
     menu_builder = menu_builder.separator();
 
     // Group actions
@@ -363,6 +382,8 @@ pub fn run() {
     let auto_review_config = config::load_auto_review_config(&config_dir);
     let pending_review_items: auto_review::PendingReviewItems =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let manual_poll_trigger: auto_review::ManualPollTrigger =
+        Arc::new(tokio::sync::Notify::new());
 
     // Load Slack config and create bridge (if configured)
     let slack_config = config::load_slack_config(&config_dir);
@@ -385,6 +406,7 @@ pub fn run() {
         .manage(AwayFlag(is_away.clone()))
         .manage(session_allow_tools.clone())
         .manage(pending_review_items.clone())
+        .manage(manual_poll_trigger.clone())
         .invoke_handler(tauri::generate_handler![
             get_actions,
             get_pet_config,
@@ -397,6 +419,7 @@ pub fn run() {
             respond_auth_all,
             get_hook_port,
             focus_claude_terminal,
+            trigger_check_pr,
         ])
         .setup(move |app| {
             // Fix transparent window on Windows - clear both window and webview backgrounds
@@ -450,6 +473,7 @@ pub fn run() {
                 pending_review_items.clone(),
                 slack_bridge.clone(),
                 is_away.clone(),
+                manual_poll_trigger.clone(),
             );
 
             // Poll foreground window to detect when user switches to Claude terminal
@@ -473,11 +497,17 @@ pub fn run() {
             let menu_slack = slack_bridge.clone();
             let menu_auto = auto_approve.clone();
             let menu_session = last_terminal_session.clone();
+            let menu_trigger = manual_poll_trigger.clone();
             app.on_menu_event(move |app, event| {
                 let id = event.id().as_ref().to_string();
 
                 if id == "_pawkit_quit" {
                     app.exit(0);
+                    return;
+                }
+                if id == "_pawkit_check_pr" {
+                    menu_trigger.notify_one();
+                    plog!("[Pawkit] Manual check-pr triggered from menu");
                     return;
                 }
                 if id.starts_with("_group_") {

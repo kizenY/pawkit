@@ -12,14 +12,20 @@ interface ReviewItem {
   url: string;
   item_type: string;
   body: string;
+  is_own_pr: boolean;
+  notification_id: string;
 }
 
 const queue = ref<ReviewItem[]>([]);
 const current = ref<ReviewItem | null>(null);
 const processing = ref(false);
+const processingItem = ref<ReviewItem | null>(null);
+const doneItem = ref<ReviewItem | null>(null);
+const doneError = ref<string | null>(null);
 let unlistenFound: UnlistenFn | null = null;
 let unlistenDone: UnlistenFn | null = null;
 let unlistenError: UnlistenFn | null = null;
+let doneTimer: ReturnType<typeof setTimeout> | null = null;
 
 const emit = defineEmits<{
   reviewActive: [active: boolean];
@@ -27,7 +33,7 @@ const emit = defineEmits<{
 }>();
 
 function processQueue() {
-  if (current.value || processing.value) return;
+  if (current.value || processing.value || doneItem.value) return;
   if (queue.value.length === 0) {
     emit("reviewActive", false);
     return;
@@ -38,6 +44,7 @@ function processQueue() {
 
 async function approve() {
   if (!current.value) return;
+  processingItem.value = current.value;
   processing.value = true;
   emit("reviewBubble", "reviewing");
   await invoke("approve_review_item", { id: current.value.id });
@@ -58,6 +65,15 @@ function skip() {
   processQueue();
 }
 
+function dismissDone() {
+  if (doneTimer) clearTimeout(doneTimer);
+  doneTimer = null;
+  doneItem.value = null;
+  doneError.value = null;
+  emit("reviewBubble", null);
+  processQueue();
+}
+
 onMounted(async () => {
   unlistenFound = await listen<ReviewItem>("review_item_found", (event) => {
     queue.value.push(event.payload);
@@ -65,13 +81,21 @@ onMounted(async () => {
   });
   unlistenDone = await listen<string>("review_item_done", () => {
     processing.value = false;
+    doneItem.value = processingItem.value;
+    doneError.value = null;
+    processingItem.value = null;
     emit("reviewBubble", "done");
-    processQueue();
+    if (doneTimer) clearTimeout(doneTimer);
+    doneTimer = setTimeout(dismissDone, 5000);
   });
-  unlistenError = await listen("review_item_error", () => {
+  unlistenError = await listen<{ id: string; error: string }>("review_item_error", (event) => {
     processing.value = false;
+    doneItem.value = processingItem.value;
+    doneError.value = event.payload?.error || "Unknown error";
+    processingItem.value = null;
     emit("reviewBubble", "done");
-    processQueue();
+    if (doneTimer) clearTimeout(doneTimer);
+    doneTimer = setTimeout(dismissDone, 5000);
   });
 });
 
@@ -83,10 +107,24 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <!-- Result card: shown after review completes -->
   <Transition name="slide-review">
-    <div v-if="current && !processing" class="review-card" @mousedown.prevent>
+    <div v-if="doneItem" class="review-card" @mousedown.prevent @click="dismissDone">
+      <div class="review-type" :style="{ color: doneError ? '#ff6b6b' : '#6bff6b' }">
+        {{ doneError ? "Failed" : doneItem.is_own_pr ? "Feedback Done" : "Review Done" }}
+      </div>
+      <div class="review-title">
+        {{ doneItem.repo.split("/")[1] }}#{{ doneItem.pr_number }}
+      </div>
+      <div class="review-desc">{{ doneError || doneItem.title }}</div>
+    </div>
+  </Transition>
+
+  <!-- Prompt card: waiting for user decision -->
+  <Transition name="slide-review">
+    <div v-if="!doneItem && current && !processing" class="review-card" @mousedown.prevent>
       <div class="review-type">
-        {{ current.item_type === "review_request" ? "Review" : current.item_type === "comment" ? "Comment" : "@Mention" }}
+        {{ current.is_own_pr ? "My PR" : current.item_type === "review_request" ? "Review" : current.item_type === "comment" ? "Comment" : "@Mention" }}
       </div>
       <div class="review-title" @mousedown.prevent @click="openPr">
         {{ current.repo.split("/")[1] }}#{{ current.pr_number }}
