@@ -2,6 +2,21 @@ use crate::config::Action;
 use serde::Serialize;
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+fn build_shell_command(command: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new("cmd");
+    c.raw_arg(format!("/C {}", command));
+    c
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_shell_command(command: &str) -> Command {
+    let mut c = Command::new("/bin/sh");
+    c.args(["-c", command]);
+    c
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ActionResult {
     pub action_id: String,
@@ -53,16 +68,7 @@ type ExecResult = Result<(String, String, Option<i32>), String>;
 fn execute_shell(action: &Action) -> ExecResult {
     let command = action.command.as_deref().ok_or("Missing 'command' field")?;
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        use std::os::windows::process::CommandExt;
-        let mut c = Command::new("cmd");
-        c.raw_arg(format!("/C {}", command));
-        c
-    } else {
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", command]);
-        c
-    };
+    let mut cmd = build_shell_command(command);
 
     if let Some(workdir) = &action.workdir {
         cmd.current_dir(workdir);
@@ -238,40 +244,49 @@ fn execute_claude(action: &Action) -> ExecResult {
         ));
     }
 
-    if cfg!(target_os = "windows") {
-        let bash_path = find_git_bash()
-            .ok_or("Cannot find git-bash. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")?;
+    launch_claude_in_terminal(&workdir)
+}
 
-        // Use cmd to set CLAUDE_CODE_GIT_BASH_PATH so claude can find git-bash,
-        // then launch claude. /k keeps the window open after claude exits.
-        use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("cmd");
-        cmd.raw_arg(format!(
-            r#"/C start "" wt -d "{workdir}" cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
-            workdir = workdir,
-            bash = bash_path,
-        ));
-        run_command(cmd)
-    } else if cfg!(target_os = "macos") {
-        let script = format!(
-            r#"tell application "Terminal"
-                activate
-                do script "cd '{}' && claude"
-            end tell"#,
-            workdir
-        );
-        let mut cmd = Command::new("osascript");
-        cmd.args(["-e", &script]);
-        run_command(cmd)
-    } else {
-        // Linux: try common terminal emulators
-        let mut cmd = Command::new("bash");
-        cmd.args(["-c", &format!(
-            r#"cd '{}' && x-terminal-emulator -e bash -lic claude 2>/dev/null || gnome-terminal -- bash -lic claude 2>/dev/null || konsole -e bash -lic claude 2>/dev/null || xterm -e bash -lic claude"#,
-            workdir
-        )]);
-        run_command(cmd)
-    }
+#[cfg(target_os = "windows")]
+fn launch_claude_in_terminal(workdir: &str) -> ExecResult {
+    use std::os::windows::process::CommandExt;
+    let bash_path = find_git_bash()
+        .ok_or("Cannot find git-bash. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")?;
+
+    // Use cmd to set CLAUDE_CODE_GIT_BASH_PATH so claude can find git-bash,
+    // then launch claude. /k keeps the window open after claude exits.
+    let mut cmd = Command::new("cmd");
+    cmd.raw_arg(format!(
+        r#"/C start "" wt -d "{workdir}" cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
+        workdir = workdir,
+        bash = bash_path,
+    ));
+    run_command(cmd)
+}
+
+#[cfg(target_os = "macos")]
+fn launch_claude_in_terminal(workdir: &str) -> ExecResult {
+    let script = format!(
+        r#"tell application "Terminal"
+            activate
+            do script "cd '{}' && claude"
+        end tell"#,
+        workdir
+    );
+    let mut cmd = Command::new("osascript");
+    cmd.args(["-e", &script]);
+    run_command(cmd)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn launch_claude_in_terminal(workdir: &str) -> ExecResult {
+    // Linux: try common terminal emulators
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", &format!(
+        r#"cd '{}' && x-terminal-emulator -e bash -lic claude 2>/dev/null || gnome-terminal -- bash -lic claude 2>/dev/null || konsole -e bash -lic claude 2>/dev/null || xterm -e bash -lic claude"#,
+        workdir
+    )]);
+    run_command(cmd)
 }
 
 #[cfg(target_os = "windows")]
