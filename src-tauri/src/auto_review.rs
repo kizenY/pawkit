@@ -323,6 +323,16 @@ async fn poll_github(
 
     plog!("[Pawkit] Received {} notifications", notifications.len());
 
+    // Prune seen set to prevent unbounded growth — keep at most 500 entries.
+    // Oldest entries are implicitly stale since we only poll the last 24h.
+    {
+        let mut seen_lock = seen.lock().await;
+        if seen_lock.len() > 500 {
+            plog!("[Pawkit] Pruning seen set ({} entries)", seen_lock.len());
+            seen_lock.clear();
+        }
+    }
+
     for notif in notifications {
         // Only handle PR-related notifications
         let subject_type = notif["subject"]["type"].as_str().unwrap_or("");
@@ -460,14 +470,24 @@ async fn mark_notification_read(client: &reqwest::Client, thread_id: &str) {
     }
 }
 
-/// Mark a notification as read by thread ID (public, creates its own client)
+/// Lazily-initialized GitHub client for use outside the poll loop (e.g. skip_review_item).
+/// Created once, reused for all subsequent calls.
+static SHARED_CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
+
+async fn get_shared_client() -> Result<&'static reqwest::Client, String> {
+    SHARED_CLIENT.get_or_try_init(|| async {
+        let token = get_github_token(&None).await?;
+        Ok(github_client(&token))
+    }).await
+}
+
+/// Mark a notification as read by thread ID (public, reuses a shared client)
 pub async fn mark_notification_read_by_id(thread_id: &str) {
-    let token = match get_github_token(&None).await {
-        Ok(t) => t,
+    let client = match get_shared_client().await {
+        Ok(c) => c,
         Err(_) => return,
     };
-    let client = github_client(&token);
-    mark_notification_read(&client, thread_id).await;
+    mark_notification_read(client, thread_id).await;
 }
 
 /// Try to merge a PR if it's in a mergeable state (all checks pass, approved, no conflicts).
@@ -546,23 +566,27 @@ async fn process_approved_items(
                 // Post result to Slack in away mode
                 post_review_result_to_slack(slack, is_away, &item, &output).await;
 
-                // Try to auto-merge if the PR is in a mergeable state
-                let merged = match try_merge_pr(client, &item.repo, item.pr_number).await {
-                    Ok(true) => {
-                        plog!("[Pawkit] Auto-merged {} #{}", item.repo, item.pr_number);
-                        if is_away.load(Ordering::SeqCst) {
-                            if let Some(ref s) = slack {
-                                let _ = s.reply(&format!(
-                                    "🎉 *Auto-merged*: `{}` #{}", item.repo, item.pr_number
-                                )).await;
+                // Try to auto-merge only if enabled in config (default: off)
+                let merged = if !config.auto_merge {
+                    false
+                } else {
+                    match try_merge_pr(client, &item.repo, item.pr_number).await {
+                        Ok(true) => {
+                            plog!("[Pawkit] Auto-merged {} #{}", item.repo, item.pr_number);
+                            if is_away.load(Ordering::SeqCst) {
+                                if let Some(ref s) = slack {
+                                    let _ = s.reply(&format!(
+                                        "🎉 *Auto-merged*: `{}` #{}", item.repo, item.pr_number
+                                    )).await;
+                                }
                             }
+                            true
                         }
-                        true
-                    }
-                    Ok(false) => false,
-                    Err(e) => {
-                        plog!("[Pawkit] Auto-merge failed for {} #{}: {}", item.repo, item.pr_number, e);
-                        false
+                        Ok(false) => false,
+                        Err(e) => {
+                            plog!("[Pawkit] Auto-merge failed for {} #{}: {}", item.repo, item.pr_number, e);
+                            false
+                        }
                     }
                 };
 

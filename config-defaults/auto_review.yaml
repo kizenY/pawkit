@@ -7,6 +7,10 @@
 enabled: false
 interval_minutes: 5
 
+# Auto-merge PRs after successful review? (default: false)
+# ⚠️ Use with caution — AI review approval ≠ human approval.
+auto_merge: false
+
 # Repos to watch for review requests (empty = monitor ALL repos)
 repos: []
 

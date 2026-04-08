@@ -186,14 +186,25 @@ pub fn seed_default_configs() {
 
     let config_dir = get_config_dir();
 
-    // Find bundled defaults next to the executable
-    let defaults_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("config-defaults")));
+    // Find bundled defaults: check exe parent (Windows/Linux) and
+    // macOS .app/Contents/Resources/ (Tauri bundles resources there).
+    let defaults_dir = std::env::current_exe().ok().and_then(|exe| {
+        // 1. Next to the executable (Windows, Linux)
+        let beside_exe = exe.parent()?.join("config-defaults");
+        if beside_exe.exists() {
+            return Some(beside_exe);
+        }
+        // 2. macOS: .app/Contents/MacOS/../Resources/config-defaults
+        let resources = exe.parent()?.parent()?.join("Resources").join("config-defaults");
+        if resources.exists() {
+            return Some(resources);
+        }
+        None
+    });
 
     let defaults_dir = match defaults_dir {
-        Some(d) if d.exists() => d,
-        _ => return,
+        Some(d) => d,
+        None => return,
     };
 
     let defaults = ["actions.yaml", "pet.yaml", "auto_review.yaml"];
@@ -296,6 +307,9 @@ pub struct AutoReviewConfig {
     /// GitHub account to use (runs `gh auth switch -u <account>` before each poll)
     #[serde(default)]
     pub gh_account: Option<String>,
+    /// Whether to auto-merge PRs after successful review (default: false)
+    #[serde(default)]
+    pub auto_merge: bool,
 }
 
 fn default_review_interval() -> u64 { 5 }
@@ -308,6 +322,7 @@ impl Default for AutoReviewConfig {
             repos: Vec::new(),
             repo_dirs: HashMap::new(),
             gh_account: None,
+            auto_merge: false,
         }
     }
 }
