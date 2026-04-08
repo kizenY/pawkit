@@ -280,46 +280,131 @@ async fn show_context_menu(
     Ok(())
 }
 
+fn create_tray_menu<M: Manager<tauri::Wry>>(
+    app: &M,
+    config: &config::AppConfig,
+) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    let mut menu_builder = MenuBuilder::new(app);
+
+    // Show/Hide pet
+    let show = MenuItemBuilder::with_id("_tray_show", "显示宠物").build(app)?;
+    let hide = MenuItemBuilder::with_id("_tray_hide", "隐藏宠物").build(app)?;
+    menu_builder = menu_builder.item(&show).item(&hide).separator();
+
+    // Group actions (same logic as context menu)
+    let mut groups: std::collections::BTreeMap<String, Vec<&config::Action>> =
+        std::collections::BTreeMap::new();
+    let mut ungrouped: Vec<&config::Action> = Vec::new();
+
+    for action in &config.actions.actions {
+        if !action.enabled {
+            continue;
+        }
+        if let Some(ref group) = action.group {
+            groups.entry(group.clone()).or_default().push(action);
+        } else {
+            ungrouped.push(action);
+        }
+    }
+
+    for action in &ungrouped {
+        let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
+        let item = MenuItemBuilder::with_id(&action.id, label).build(app)?;
+        menu_builder = menu_builder.item(&item);
+    }
+
+    for (group_name, group_actions) in &groups {
+        if !ungrouped.is_empty() || groups.len() > 1 {
+            menu_builder = menu_builder.separator();
+        }
+        let group_label = MenuItemBuilder::with_id(
+            format!("_group_{}", group_name),
+            format!("  {}  ", group_name),
+        )
+        .enabled(false)
+        .build(app)?;
+        menu_builder = menu_builder.item(&group_label);
+
+        for action in group_actions {
+            let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
+            let item = MenuItemBuilder::with_id(&action.id, label).build(app)?;
+            menu_builder = menu_builder.item(&item);
+        }
+    }
+
+    menu_builder = menu_builder.separator();
+    let quit = MenuItemBuilder::with_id("_tray_quit", "退出 Pawkit").build(app)?;
+    menu_builder = menu_builder.item(&quit);
+
+    Ok(menu_builder.build()?)
+}
+
 fn build_tray_menu(
     app: &tauri::App,
+    shared_config: SharedConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let show = MenuItemBuilder::with_id("show", "Show Pawkit").build(app)?;
-    let hide = MenuItemBuilder::with_id("hide", "Hide Pawkit").build(app)?;
-    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let menu = {
+        let config = shared_config.lock().unwrap();
+        create_tray_menu(app, &config)?
+    };
 
-    let menu = MenuBuilder::new(app)
-        .item(&show)
-        .item(&hide)
-        .separator()
-        .item(&quit)
-        .build()?;
-
-    let _tray = TrayIconBuilder::new()
+    let tray_config = shared_config.clone();
+    let _tray = TrayIconBuilder::with_id("main_tray")
         .icon(tauri::include_image!("icons/32x32.png"))
         .tooltip("Pawkit")
         .menu(&menu)
-        .on_menu_event(move |app, event| {
-            match event.id().as_ref() {
-                "show" => {
+        .on_menu_event(move |app: &tauri::AppHandle, event| {
+            let id = event.id().as_ref().to_string();
+            match id.as_str() {
+                "_tray_show" => {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
                 }
-                "hide" => {
+                "_tray_hide" => {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.hide();
                     }
                 }
-                "quit" => {
+                "_tray_quit" => {
                     app.exit(0);
                 }
-                _ => {}
+                id if id.starts_with("_") => {}
+                _ => {
+                    let action = {
+                        let config = tray_config.lock().unwrap();
+                        config.actions.actions.iter().find(|a| a.id == *id).cloned()
+                    };
+                    if let Some(action) = action {
+                        let app_handle = app.clone();
+                        let _ = app_handle.emit("action_started", &action.id);
+                        std::thread::spawn(move || {
+                            let result = execute_action(&action);
+                            let _ = app_handle.emit("action_finished", &result);
+                        });
+                    }
+                }
             }
         })
         .build(app)?;
 
     Ok(())
+}
+
+/// Rebuild the tray menu after config changes
+fn rebuild_tray_menu(app_handle: &tauri::AppHandle, shared_config: &SharedConfig) {
+    let config = shared_config.lock().unwrap();
+    match create_tray_menu(app_handle, &config) {
+        Ok(menu) => {
+            if let Some(tray) = app_handle.tray_by_id("main_tray") {
+                let _ = tray.set_menu(Some(menu));
+            }
+        }
+        Err(e) => {
+            plog!("[Pawkit] Failed to rebuild tray menu: {}", e);
+        }
+    }
 }
 
 fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfig) {
@@ -354,6 +439,7 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
                     let mut config = shared_config.lock().unwrap();
                     *config = new_config;
                 }
+                rebuild_tray_menu(&app_handle, &shared_config);
                 let _ = app_handle.emit("config_changed", ());
             }
         }
@@ -450,7 +536,7 @@ pub fn run() {
                 }
             }
 
-            build_tray_menu(app)?;
+            build_tray_menu(app, shared_config.clone())?;
 
             let app_handle = app.handle().clone();
             start_config_watcher(app_handle.clone(), shared_config.clone());
