@@ -23,14 +23,15 @@ fn attach_parent_console() {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if std::env::args().len() > 1 {
+        attach_parent_console();
+    }
+
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(cmd) => {
-            #[cfg(target_os = "windows")]
-            attach_parent_console();
-            pawkit_lib::cli::run_cli(cmd);
-        }
+        Some(cmd) => pawkit_lib::cli::run_cli(cmd),
         None => pawkit_lib::run(),
     }
 }

@@ -2,7 +2,7 @@ use crate::config::{get_config_dir, load_actions};
 use crate::executor::execute_action;
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 #[derive(Parser)]
 #[command(name = "pawkit", about = "Desktop pet with customizable quick actions")]
@@ -77,12 +77,11 @@ pub fn run_cli(cmd: &Commands) {
             }
         }
         Commands::Run { action_id, yes } => {
-            let action = actions_config
-                .actions
-                .iter()
-                .find(|a| a.id == *action_id && a.enabled);
-
-            let action = match action {
+            let action = match actions_config.actions.iter().find(|a| a.id == *action_id) {
+                Some(a) if !a.enabled => {
+                    eprintln!("Action '{}' is disabled.", action_id);
+                    std::process::exit(1);
+                }
                 Some(a) => a,
                 None => {
                     eprintln!("Action '{}' not found. Use `pawkit list` to see available actions.", action_id);
@@ -91,7 +90,7 @@ pub fn run_cli(cmd: &Commands) {
             };
 
             if action.confirm && !yes {
-                let is_tty = atty::is(atty::Stream::Stdin);
+                let is_tty = std::io::stdin().is_terminal();
                 if !is_tty {
                     eprintln!("Action '{}' requires confirmation. Use -y to skip, or run from an interactive terminal.", action.name);
                     std::process::exit(1);
