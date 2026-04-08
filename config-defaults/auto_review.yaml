@@ -1,17 +1,21 @@
 # Auto Review Configuration
 # Pawkit will periodically check GitHub for review requests and @mentions,
 # then use Claude Code to handle them (with your approval via the cat UI).
+#
+# Config location: %APPDATA%/pawkit/auto_review.yaml
 
-enabled: true
+enabled: false
 interval_minutes: 5
 
-# GitHub account to use (for multi-account setups)
-# gh_account: your-github-username
+# Auto-merge PRs after successful review? (default: false)
+# ⚠️ Use with caution — AI review approval ≠ human approval.
+auto_merge: false
 
 # Repos to watch for review requests (empty = monitor ALL repos)
 repos: []
 
 # Working directories for each repo (Claude Code needs to run in the right dir)
-repo_dirs:
-  SeesawTech/seesaw-main: "E:\\develop\\code\\seesaw\\seesaw-main"
-  SeesawTech/seesaw-server: "E:\\develop\\code\\seesaw\\seesaw-main\\server"
+# Example:
+# repo_dirs:
+#   owner/repo: "C:\\path\\to\\repo"
+repo_dirs: {}

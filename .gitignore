@@ -17,6 +17,6 @@ Thumbs.db
 # Temp
 .pnpmrc.json
 
-# Slack tokens (sensitive)
-config/slack.yaml
-config/.last_terminal_session.json
+# User config (contains personal paths, tokens, etc.)
+# Default templates are in config-defaults/ (tracked)
+config/

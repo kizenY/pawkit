@@ -1,0 +1,32 @@
+# Pawkit Actions Configuration
+# This file defines all quick actions available in the pet's right-click menu.
+# See docs/CONFIG.md for full schema reference.
+# This file is hot-reloaded — changes take effect immediately.
+#
+# Config location: %APPDATA%/pawkit/actions.yaml
+
+actions:
+  - id: meow
+    name: "喵~"
+    icon: "🐱"
+    type: meow
+
+  - id: claude-code
+    name: "Claude Code"
+    icon: "🤖"
+    type: claude
+    # workdir: "C:\\path\\to\\project"  # defaults to home directory
+
+  # Example: open a URL
+  # - id: open-docs
+  #   name: "Open Docs"
+  #   icon: "📖"
+  #   type: url
+  #   url: "https://example.com"
+
+  # Example: run a shell command
+  # - id: hello
+  #   name: "Say Hello"
+  #   icon: "👋"
+  #   type: shell
+  #   command: "echo hello"

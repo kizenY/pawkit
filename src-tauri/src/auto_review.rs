@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Emitter;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 /// Build a reqwest client with GitHub API auth headers.
 /// Token is obtained from `gh auth token` at startup.
@@ -62,6 +62,19 @@ fn github_client(token: &str) -> reqwest::Client {
         .expect("failed to build reqwest client")
 }
 
+/// Get the authenticated GitHub user's login name
+async fn get_github_username(client: &reqwest::Client) -> Result<String, String> {
+    let resp = client
+        .get("https://api.github.com/user")
+        .send().await
+        .map_err(|e| format!("GitHub user API failed: {}", e))?;
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse user response: {}", e))?;
+    body["login"].as_str()
+        .map(String::from)
+        .ok_or_else(|| "No login in user response".to_string())
+}
+
 /// A review item detected by the polling loop
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewItem {
@@ -70,8 +83,12 @@ pub struct ReviewItem {
     pub pr_number: u64,
     pub title: String,
     pub url: String,
-    pub item_type: String, // "review_request" or "mention"
-    pub body: String,      // comment body for mentions, empty for review requests
+    pub item_type: String, // "review_request", "mention", or "comment"
+    pub body: String,      // comment body for context display
+    #[serde(default)]
+    pub is_own_pr: bool,
+    #[serde(default)]
+    pub notification_id: String,
 }
 
 /// Tracks which items we've already notified about
@@ -84,6 +101,9 @@ type ApprovedRx = mpsc::Receiver<ReviewItem>;
 /// Pending review items waiting for user decision
 pub type PendingReviewItems = Arc<Mutex<Vec<ReviewItem>>>;
 
+/// Manual trigger for immediate poll
+pub type ManualPollTrigger = Arc<Notify>;
+
 /// Start the auto-review background system
 pub fn start_auto_review(
     app_handle: tauri::AppHandle,
@@ -91,6 +111,7 @@ pub fn start_auto_review(
     pending_items: PendingReviewItems,
     slack: Option<Arc<SlackBridge>>,
     is_away: Arc<AtomicBool>,
+    manual_trigger: ManualPollTrigger,
 ) {
     if !config.enabled {
         plog!("[Pawkit] Auto-review disabled");
@@ -131,7 +152,19 @@ pub fn start_auto_review(
         let client = github_client(&token);
         let client2 = client.clone();
 
-        // Task 1: Poll GitHub for review requests and mentions
+        // Get authenticated user's login for determining PR ownership
+        let username = match get_github_username(&client).await {
+            Ok(u) => {
+                plog!("[Pawkit] GitHub user: {}", u);
+                u
+            }
+            Err(e) => {
+                plog!("[Pawkit] Failed to get GitHub username: {}. Auto-review polling disabled.", e);
+                return;
+            }
+        };
+
+        // Task 1: Poll GitHub notifications
         tauri::async_runtime::spawn(async move {
             let interval = Duration::from_secs(poll_config.interval_minutes * 60);
             // Initial short delay before first poll
@@ -140,11 +173,16 @@ pub fn start_auto_review(
             loop {
                 if let Err(e) = poll_github(
                     &client, &poll_handle, &poll_config, &poll_seen, &poll_pending,
-                    &poll_slack, &poll_away,
+                    &poll_slack, &poll_away, &username,
                 ).await {
                     plog!("[Pawkit] Auto-review poll error: {}", e);
                 }
-                tokio::time::sleep(interval).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {},
+                    _ = manual_trigger.notified() => {
+                        plog!("[Pawkit] Manual check-pr triggered");
+                    },
+                }
             }
         });
 
@@ -181,11 +219,15 @@ async fn notify_review_item(
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
 ) {
-    let type_label = match item.item_type.as_str() {
-        "review_request" => "Review Request",
-        "mention" => "@Mention",
-        "comment" => "New Comment",
-        _ => "Notification",
+    let type_label = if item.is_own_pr {
+        "My PR Update"
+    } else {
+        match item.item_type.as_str() {
+            "review_request" => "Review Request",
+            "mention" => "@Mention",
+            "comment" => "New Comment",
+            _ => "Notification",
+        }
     };
 
     if is_away.load(Ordering::SeqCst) {
@@ -214,7 +256,7 @@ async fn post_review_result_to_slack(
     }
     let Some(ref slack) = slack else { return };
 
-    let type_label = if item.item_type == "review_request" { "Review" } else { "Reply" };
+    let type_label = if item.is_own_pr { "PR Feedback" } else { "Review" };
     let header = format!("✅ *{} complete*: `{}` #{}", type_label, item.repo, item.pr_number);
     let _ = slack.reply(&header).await;
 
@@ -249,7 +291,7 @@ async fn post_review_error_to_slack(
     )).await;
 }
 
-/// Poll GitHub for review requests and mentions using the REST API directly.
+/// Poll GitHub notifications for PR-related items.
 async fn poll_github(
     client: &reqwest::Client,
     app_handle: &tauri::AppHandle,
@@ -258,144 +300,60 @@ async fn poll_github(
     pending: &PendingReviewItems,
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
+    username: &str,
 ) -> Result<(), String> {
-    plog!("[Pawkit] Polling GitHub for review items...");
+    plog!("[Pawkit] Polling GitHub notifications...");
 
-    // 1. Check review requests
-    if config.repos.is_empty() {
-        // No repo filter: search all PRs requesting review from @me
-        let resp = client
-            .get("https://api.github.com/search/issues")
-            .query(&[
-                ("q", "is:pr is:open review-requested:@me"),
-                ("per_page", "20"),
-            ])
-            .send().await
-            .map_err(|e| format!("GitHub search API failed: {}", e))?;
-
-        let body: serde_json::Value = resp.json().await
-            .map_err(|e| format!("Failed to parse search response: {}", e))?;
-
-        if let Some(items) = body["items"].as_array() {
-            for item in items {
-                let number = item["number"].as_u64().unwrap_or(0);
-                // Extract repo from repository_url: https://api.github.com/repos/OWNER/REPO
-                let repo = item["repository_url"].as_str().unwrap_or("")
-                    .strip_prefix("https://api.github.com/repos/")
-                    .unwrap_or("").to_string();
-                if repo.is_empty() { continue; }
-                let id = format!("review_{}_{}", repo, number);
-
-                let mut seen_lock = seen.lock().await;
-                if seen_lock.contains(&id) { continue; }
-                seen_lock.insert(id.clone());
-                drop(seen_lock);
-
-                let review_item = ReviewItem {
-                    id,
-                    repo: repo.clone(),
-                    pr_number: number,
-                    title: item["title"].as_str().unwrap_or("").to_string(),
-                    url: item["html_url"].as_str().unwrap_or("").to_string(),
-                    item_type: "review_request".to_string(),
-                    body: String::new(),
-                };
-
-                plog!("[Pawkit] Found review request: {} #{}", repo, number);
-                pending.lock().await.push(review_item.clone());
-                notify_review_item(app_handle, &review_item, slack, is_away).await;
-            }
-        }
-    } else {
-        // Specific repos: search PRs requesting review from @me per repo
-        for repo in &config.repos {
-            let query = format!("is:pr is:open review-requested:@me repo:{}", repo);
-            let resp = client
-                .get("https://api.github.com/search/issues")
-                .query(&[("q", query.as_str()), ("per_page", "10")])
-                .send().await;
-
-            let resp = match resp {
-                Ok(r) => r,
-                Err(e) => {
-                    plog!("[Pawkit] Failed to search PRs for {}: {}", repo, e);
-                    continue;
-                }
-            };
-
-            let body: serde_json::Value = match resp.json().await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let items = match body["items"].as_array() {
-                Some(a) => a,
-                None => continue,
-            };
-
-            for pr in items {
-                let number = pr["number"].as_u64().unwrap_or(0);
-                let id = format!("review_{}_{}", repo, number);
-
-                let mut seen_lock = seen.lock().await;
-                if seen_lock.contains(&id) { continue; }
-                seen_lock.insert(id.clone());
-                drop(seen_lock);
-
-                let review_item = ReviewItem {
-                    id,
-                    repo: repo.clone(),
-                    pr_number: number,
-                    title: pr["title"].as_str().unwrap_or("").to_string(),
-                    url: pr["html_url"].as_str().unwrap_or("").to_string(),
-                    item_type: "review_request".to_string(),
-                    body: String::new(),
-                };
-
-                plog!("[Pawkit] Found review request: {} #{}", repo, number);
-                pending.lock().await.push(review_item.clone());
-                notify_review_item(app_handle, &review_item, slack, is_away).await;
-            }
-        }
-    }
-
-    // 2. Check notifications for mentions and new comments
+    // Use all=true to include read notifications (new activity changes updated_at,
+    // caught by seen set). participating=true limits to threads we're involved in.
+    let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let resp = client
         .get("https://api.github.com/notifications")
+        .query(&[
+            ("all", "true"),
+            ("participating", "true"),
+            ("since", since.as_str()),
+            ("per_page", "50"),
+        ])
         .send().await
         .map_err(|e| format!("GitHub notifications API failed: {}", e))?;
 
     let notifications: Vec<serde_json::Value> = resp.json().await
         .map_err(|e| format!("Failed to parse notifications: {}", e))?;
 
-    for notif in notifications {
-        let reason = notif["reason"].as_str().unwrap_or("");
-        // Only handle mention, comment, and subscribed (PR participant) notifications
-        let item_type = match reason {
-            "mention" => "mention",
-            "comment" | "subscribed" => "comment",
-            _ => continue,
-        };
+    plog!("[Pawkit] Received {} notifications", notifications.len());
 
-        let notif_id = notif["id"].as_str().unwrap_or("").to_string();
-        let repo = notif["repository"]["full_name"].as_str().unwrap_or("").to_string();
-        let id = format!("{}_{}", item_type, notif_id);
-
-        // Only track repos we're configured to watch (skip filter if repos list is empty = all repos)
-        if !config.repos.is_empty() && !config.repos.iter().any(|r| r == &repo) {
-            continue;
+    // Prune seen set to prevent unbounded growth — keep at most 500 entries.
+    // Oldest entries are implicitly stale since we only poll the last 24h.
+    {
+        let mut seen_lock = seen.lock().await;
+        if seen_lock.len() > 500 {
+            plog!("[Pawkit] Pruning seen set ({} entries)", seen_lock.len());
+            seen_lock.clear();
         }
+    }
 
+    for notif in notifications {
         // Only handle PR-related notifications
         let subject_type = notif["subject"]["type"].as_str().unwrap_or("");
         if subject_type != "PullRequest" {
             continue;
         }
 
-        let mut seen_lock = seen.lock().await;
-        if seen_lock.contains(&id) { continue; }
-        seen_lock.insert(id.clone());
-        drop(seen_lock);
+        let notif_id = notif["id"].as_str().unwrap_or("").to_string();
+        let repo = notif["repository"]["full_name"].as_str().unwrap_or("").to_string();
+        let reason = notif["reason"].as_str().unwrap_or("");
+        let updated_at = notif["updated_at"].as_str().unwrap_or("");
+
+        // Filter by configured repos (empty = all repos)
+        if !config.repos.is_empty() && !config.repos.iter().any(|r| r == &repo) {
+            continue;
+        }
+
+        // Include updated_at so the same thread is re-processed when new activity arrives
+        let id = format!("pr_{}_{}_{}", repo, notif_id, updated_at);
+
+        if seen.lock().await.contains(&id) { continue; }
 
         // Extract PR number from subject URL (e.g. .../pulls/123)
         let api_url = notif["subject"]["url"].as_str().unwrap_or("");
@@ -403,31 +361,62 @@ async fn poll_github(
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
-        // Skip merged/closed PRs
-        if pr_number > 0 && !repo.is_empty() {
-            let pr_url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
-            if let Ok(pr_resp) = client.get(&pr_url).send().await {
-                if let Ok(pr_data) = pr_resp.json::<serde_json::Value>().await {
-                    let state = pr_data["state"].as_str().unwrap_or("");
-                    let merged = pr_data["merged"].as_bool().unwrap_or(false);
-                    if state == "closed" || merged {
-                        plog!("[Pawkit] Skipping {} #{}: {}", repo, pr_number,
-                            if merged { "merged" } else { "closed" });
-                        continue;
-                    }
-                }
+        if pr_number == 0 || repo.is_empty() { continue; }
+
+        // Skip if this PR is already pending
+        {
+            let pending_lock = pending.lock().await;
+            if pending_lock.iter().any(|i| i.repo == repo && i.pr_number == pr_number) {
+                continue;
             }
         }
 
-        // Convert API URL to web URL
-        let web_url = if pr_number > 0 && !repo.is_empty() {
-            format!("https://github.com/{}/pull/{}", repo, pr_number)
-        } else {
-            api_url.replace("api.github.com/repos", "github.com").replace("/pulls/", "/pull/")
+        // Fetch PR data to get creator and state
+        let pr_url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+        let pr_data = match client.get(&pr_url).send().await {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(data) => data,
+                Err(e) => {
+                    plog!("[Pawkit] Failed to parse PR data for {} #{}: {}", repo, pr_number, e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                plog!("[Pawkit] Failed to fetch PR data for {} #{}: {}", repo, pr_number, e);
+                continue;
+            }
         };
 
-        // Fetch the latest comment
-        let comment_body = fetch_latest_mention_comment(client, &repo, pr_number).await;
+        // Skip closed/merged PRs — mark notification as read and move on
+        let state = pr_data["state"].as_str().unwrap_or("");
+        let merged = pr_data["merged"].as_bool().unwrap_or(false);
+        if state == "closed" || merged {
+            plog!("[Pawkit] Skipping {} #{}: {} — marking as read", repo, pr_number,
+                if merged { "merged" } else { "closed" });
+            mark_notification_read(client, &notif_id).await;
+            seen.lock().await.insert(id);
+            continue;
+        }
+
+        // Determine if this is our own PR
+        let pr_creator = pr_data["user"]["login"].as_str().unwrap_or("");
+        let is_own_pr = pr_creator.eq_ignore_ascii_case(username);
+
+        let web_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
+
+        // Fetch latest comment for context display
+        let comment_body = match reason {
+            "mention" | "comment" | "subscribed" => {
+                fetch_latest_mention_comment(client, &repo, pr_number).await
+            }
+            _ => String::new(),
+        };
+
+        let item_type = match reason {
+            "review_requested" => "review_request",
+            "mention" => "mention",
+            _ => "comment",
+        };
 
         let item = ReviewItem {
             id,
@@ -437,10 +426,14 @@ async fn poll_github(
             url: web_url,
             item_type: item_type.to_string(),
             body: comment_body,
+            is_own_pr,
+            notification_id: notif_id,
         };
 
-        plog!("[Pawkit] Found {}: {} #{}", item_type, repo, pr_number);
+        plog!("[Pawkit] Found PR notification: {} #{} (own={}, reason={})",
+            repo, pr_number, is_own_pr, reason);
         pending.lock().await.push(item.clone());
+        seen.lock().await.insert(item.id.clone());
         notify_review_item(app_handle, &item, slack, is_away).await;
     }
 
@@ -477,6 +470,67 @@ async fn mark_notification_read(client: &reqwest::Client, thread_id: &str) {
     }
 }
 
+/// Lazily-initialized GitHub client for use outside the poll loop (e.g. skip_review_item).
+/// Created once, reused for all subsequent calls.
+static SHARED_CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
+
+async fn get_shared_client() -> Result<&'static reqwest::Client, String> {
+    SHARED_CLIENT.get_or_try_init(|| async {
+        let token = get_github_token(&None).await?;
+        Ok(github_client(&token))
+    }).await
+}
+
+/// Mark a notification as read by thread ID (public, reuses a shared client)
+pub async fn mark_notification_read_by_id(thread_id: &str) {
+    let client = match get_shared_client().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    mark_notification_read(client, thread_id).await;
+}
+
+/// Try to merge a PR if it's in a mergeable state (all checks pass, approved, no conflicts).
+/// Returns Ok(true) if merged, Ok(false) if not mergeable, Err on API failure.
+async fn try_merge_pr(
+    client: &reqwest::Client,
+    repo: &str,
+    pr_number: u64,
+) -> Result<bool, String> {
+    let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+    let resp = client.get(&url).send().await
+        .map_err(|e| format!("Failed to fetch PR: {}", e))?;
+    let pr: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse PR: {}", e))?;
+
+    let mergeable = pr["mergeable"].as_bool();
+    let state = pr["mergeable_state"].as_str().unwrap_or("");
+
+    if mergeable != Some(true) || state != "clean" {
+        plog!("[Pawkit] PR {} #{} not mergeable (mergeable={:?}, state={})",
+            repo, pr_number, mergeable, state);
+        return Ok(false);
+    }
+
+    let title = pr["title"].as_str().unwrap_or("");
+    let merge_url = format!("https://api.github.com/repos/{}/pulls/{}/merge", repo, pr_number);
+    let resp = client.put(&merge_url)
+        .json(&serde_json::json!({
+            "commit_title": format!("{} (#{})", title, pr_number),
+            "merge_method": "squash"
+        }))
+        .send().await
+        .map_err(|e| format!("Merge API failed: {}", e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        Ok(true)
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("Merge failed ({}): {}", status, body))
+    }
+}
+
 /// Process approved review items using Claude Code
 async fn process_approved_items(
     mut rx: ApprovedRx,
@@ -486,7 +540,6 @@ async fn process_approved_items(
     is_away: &Arc<AtomicBool>,
     client: &reqwest::Client,
 ) {
-
     while let Some(item) = rx.recv().await {
         plog!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
 
@@ -513,14 +566,39 @@ async fn process_approved_items(
                 // Post result to Slack in away mode
                 post_review_result_to_slack(slack, is_away, &item, &output).await;
 
-                // Mark notification as read
-                if item.item_type == "mention" || item.item_type == "comment" {
-                    let prefix = format!("{}_", item.item_type);
-                    let notif_id = item.id.strip_prefix(&prefix).unwrap_or(&item.id);
-                    mark_notification_read(client, notif_id).await;
+                // Try to auto-merge only if enabled in config (default: off)
+                let merged = if !config.auto_merge {
+                    false
+                } else {
+                    match try_merge_pr(client, &item.repo, item.pr_number).await {
+                        Ok(true) => {
+                            plog!("[Pawkit] Auto-merged {} #{}", item.repo, item.pr_number);
+                            if is_away.load(Ordering::SeqCst) {
+                                if let Some(ref s) = slack {
+                                    let _ = s.reply(&format!(
+                                        "🎉 *Auto-merged*: `{}` #{}", item.repo, item.pr_number
+                                    )).await;
+                                }
+                            }
+                            true
+                        }
+                        Ok(false) => false,
+                        Err(e) => {
+                            plog!("[Pawkit] Auto-merge failed for {} #{}: {}", item.repo, item.pr_number, e);
+                            false
+                        }
+                    }
+                };
+
+                // Mark notification as read only on success
+                if !item.notification_id.is_empty() {
+                    mark_notification_read(client, &item.notification_id).await;
                 }
 
-                let _ = app_handle.emit("review_item_done", &item.id);
+                let _ = app_handle.emit("review_item_done", &serde_json::json!({
+                    "id": item.id,
+                    "merged": merged,
+                }));
             }
             Err(e) => {
                 plog!("[Pawkit] Review failed for {} #{}: {}", item.repo, item.pr_number, e);
@@ -545,75 +623,9 @@ async fn process_approved_items(
 }
 
 fn build_review_prompt(item: &ReviewItem) -> String {
-    match item.item_type.as_str() {
-        "review_request" => format!(
-            r#"You need to review PR #{number} "{title}" in {repo}.
-
-Steps:
-1. Run: gh pr view {number} --repo {repo}   to read the PR description
-2. Run: gh pr diff {number} --repo {repo}   to read the code changes
-3. Analyze the changes carefully for: bugs, security issues, logic errors, code quality, missing edge cases
-4. Submit your review:
-   - If changes look good: gh pr review {number} --repo {repo} --approve --body "your review comments"
-   - If issues found: gh pr review {number} --repo {repo} --request-changes --body "your detailed feedback"
-   - If minor suggestions: gh pr review {number} --repo {repo} --comment --body "your comments"
-5. If the PR is approved and ready, merge it: gh pr merge {number} --repo {repo} --squash
-
-Write review comments in English. Be concise but thorough."#,
-            number = item.pr_number,
-            title = item.title,
-            repo = item.repo,
-        ),
-        "mention" => format!(
-            r#"You were @mentioned in PR #{number} "{title}" in {repo}.
-
-The latest comment says:
----
-{body}
----
-
-Steps:
-1. Run: gh pr view {number} --repo {repo}   to understand the PR context
-2. Read the comment above and determine what's needed:
-   - If it's a question: reply with an answer using gh pr comment {number} --repo {repo} --body "..."
-   - If it asks for a review: review the PR diff and submit a review
-   - If it asks for code changes: make the changes locally, commit, and push
-   - If the PR is approved and they ask to merge: gh pr merge {number} --repo {repo} --squash
-3. Take the appropriate action.
-
-Write responses in English. Be concise."#,
-            number = item.pr_number,
-            title = item.title,
-            repo = item.repo,
-            body = if item.body.is_empty() { "(could not fetch comment)" } else { &item.body },
-        ),
-        "comment" => format!(
-            r#"There is a new comment on PR #{number} "{title}" in {repo}.
-
-The latest comment says:
----
-{body}
----
-
-Steps:
-1. Run: gh pr view {number} --repo {repo}   to understand the PR context
-2. Run: gh pr view {number} --repo {repo} --comments   to read the full comment thread
-3. Based on the comment and context, decide if this needs YOUR action:
-   - If the comment is asking you (the reviewer) for feedback, a re-review, or a response → take action
-   - If the comment is a follow-up to your previous review → take action
-   - If the comment is clearly directed at someone else or is just an FYI → do nothing
-4. If action is needed:
-   - To reply: gh pr comment {number} --repo {repo} --body "..."
-   - To re-review: review the PR diff and submit a review
-   - To approve after changes: gh pr review {number} --repo {repo} --approve --body "..."
-5. If no action is needed, just say "No action needed" and explain briefly why.
-
-Write responses in English. Be concise."#,
-            number = item.pr_number,
-            title = item.title,
-            repo = item.repo,
-            body = if item.body.is_empty() { "(could not fetch comment)" } else { &item.body },
-        ),
-        _ => String::new(),
+    if item.is_own_pr {
+        format!("/pr-creator-feedback {}", item.url)
+    } else {
+        format!("/pr-reviewer {}", item.url)
     }
 }

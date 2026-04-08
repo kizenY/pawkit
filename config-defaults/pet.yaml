@@ -1,6 +1,8 @@
 # Pawkit Pet Configuration
 # Controls the pet's appearance and behavior.
 # See docs/CONFIG.md for full reference.
+#
+# Config location: %APPDATA%/pawkit/pet.yaml
 
 pet:
   sprite: "pixel-cat"
