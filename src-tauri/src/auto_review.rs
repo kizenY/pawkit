@@ -343,10 +343,7 @@ async fn poll_github(
         // Include updated_at so the same thread is re-processed when new activity arrives
         let id = format!("pr_{}_{}_{}", repo, notif_id, updated_at);
 
-        let mut seen_lock = seen.lock().await;
-        if seen_lock.contains(&id) { continue; }
-        seen_lock.insert(id.clone());
-        drop(seen_lock);
+        if seen.lock().await.contains(&id) { continue; }
 
         // Extract PR number from subject URL (e.g. .../pulls/123)
         let api_url = notif["subject"]["url"].as_str().unwrap_or("");
@@ -369,9 +366,15 @@ async fn poll_github(
         let pr_data = match client.get(&pr_url).send().await {
             Ok(resp) => match resp.json::<serde_json::Value>().await {
                 Ok(data) => data,
-                Err(_) => continue,
+                Err(e) => {
+                    plog!("[Pawkit] Failed to parse PR data for {} #{}: {}", repo, pr_number, e);
+                    continue;
+                }
             },
-            Err(_) => continue,
+            Err(e) => {
+                plog!("[Pawkit] Failed to fetch PR data for {} #{}: {}", repo, pr_number, e);
+                continue;
+            }
         };
 
         // Skip closed/merged PRs — mark notification as read and move on
@@ -381,6 +384,7 @@ async fn poll_github(
             plog!("[Pawkit] Skipping {} #{}: {} — marking as read", repo, pr_number,
                 if merged { "merged" } else { "closed" });
             mark_notification_read(client, &notif_id).await;
+            seen.lock().await.insert(id);
             continue;
         }
 
@@ -419,6 +423,7 @@ async fn poll_github(
         plog!("[Pawkit] Found PR notification: {} #{} (own={}, reason={})",
             repo, pr_number, is_own_pr, reason);
         pending.lock().await.push(item.clone());
+        seen.lock().await.insert(item.id.clone());
         notify_review_item(app_handle, &item, slack, is_away).await;
     }
 

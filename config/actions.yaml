@@ -24,3 +24,24 @@ actions:
     confirm: true
     group: "SeeSaw Deploy"
 
+  - id: claude-code-home
+    name: "Claude → Home"
+    icon: "🏠"
+    type: shell
+    command: 'start "" wt -d "%USERPROFILE%" cmd /k claude'
+    group: "Claude Code"
+
+  - id: claude-code-seesaw
+    name: "Claude → SeeSaw"
+    icon: "🪚"
+    type: shell
+    command: 'start "" wt -d "E:\develop\code\seesaw-main" cmd /k claude'
+    group: "Claude Code"
+
+  - id: claude-code-pawkit
+    name: "Claude → Pawkit"
+    icon: "🐾"
+    type: shell
+    command: 'start "" wt -d "E:\develop\code\pawkit" cmd /k claude'
+    group: "Claude Code"
+
