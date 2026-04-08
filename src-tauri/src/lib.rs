@@ -370,21 +370,8 @@ fn build_tray_menu(
                 "_tray_quit" => {
                     app.exit(0);
                 }
-                id if id.starts_with("_") => {}
-                _ => {
-                    let action = {
-                        let config = tray_config.lock().unwrap();
-                        config.actions.actions.iter().find(|a| a.id == *id).cloned()
-                    };
-                    if let Some(action) = action {
-                        let app_handle = app.clone();
-                        let _ = app_handle.emit("action_started", &action.id);
-                        std::thread::spawn(move || {
-                            let result = execute_action(&action);
-                            let _ = app_handle.emit("action_finished", &result);
-                        });
-                    }
-                }
+                // Action items are handled by app.on_menu_event() to avoid double execution
+                _ => {}
             }
         })
         .build(app)?;

@@ -247,13 +247,19 @@ fn execute_claude(action: &Action) -> ExecResult {
             .ok_or("Cannot find git-bash. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")?;
 
         use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("cmd");
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        let mut cmd = Command::new("wt");
         cmd.raw_arg(format!(
-            r#"/C start "" wt -d "{workdir}" cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
+            r#"new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
             workdir = workdir,
             bash = bash_path,
         ));
-        return run_command(cmd);
+        cmd.creation_flags(DETACHED_PROCESS);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.spawn().map_err(|e| format!("Failed to launch terminal: {}", e))?;
+        return Ok((String::new(), String::new(), Some(0)));
     }
     #[cfg(target_os = "macos")]
     {
