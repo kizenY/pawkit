@@ -8,10 +8,8 @@ interval_minutes: 5
 # GitHub account to use (for multi-account setups)
 # gh_account: your-github-username
 
-# Repos to watch for review requests
-repos:
-  - SeesawTech/seesaw-main
-  - SeesawTech/seesaw-server
+# Repos to watch for review requests (empty = monitor ALL repos)
+repos: []
 
 # Working directories for each repo (Claude Code needs to run in the right dir)
 repo_dirs:

@@ -3,6 +3,8 @@ mod config;
 mod executor;
 mod hook_server;
 mod claude_session;
+#[macro_use]
+mod logger;
 mod slack_bridge;
 mod win_focus;
 
@@ -333,7 +335,6 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
                     *config = new_config;
                 }
                 let _ = app_handle.emit("config_changed", ());
-                println!("[Pawkit] Config reloaded");
             }
         }
     });
@@ -341,6 +342,9 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logger::init();
+    plog!("Pawkit starting...");
+
     let initial_config = config::load_all_config();
     let shared_config: SharedConfig = Arc::new(Mutex::new(initial_config));
     let pending_requests: PendingRequests =
@@ -488,7 +492,7 @@ pub fn run() {
                     let config_dir = config::get_config_dir();
                     let slack_config = config::load_slack_config(&config_dir);
                     if slack_config.bot_token.is_empty() || slack_config.dm_user_id.is_empty() {
-                        eprintln!("[Pawkit] Slack 未配置 bot_token 或 dm_user_id，无法进入外出模式");
+                        plog!("[Pawkit] Slack 未配置 bot_token 或 dm_user_id，无法进入外出模式");
                         return;
                     }
                     menu_is_away.store(true, Ordering::SeqCst);
@@ -505,7 +509,7 @@ pub fn run() {
                         }
                     });
                     let _ = app.emit("mode_changed", "away");
-                    println!("[Pawkit] 已切换到外出模式");
+                    plog!("[Pawkit] 已切换到外出模式");
                     return;
                 }
                 if id == "_pawkit_home" {
@@ -515,7 +519,7 @@ pub fn run() {
                     menu_is_away.store(false, Ordering::SeqCst);
                     menu_auto.store(false, Ordering::SeqCst);
                     let _ = app.emit("mode_changed", "home");
-                    println!("[Pawkit] 已切换到回家模式");
+                    plog!("[Pawkit] 已切换到回家模式");
                     return;
                 }
 

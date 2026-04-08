@@ -1,350 +1,236 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+
+const emit = defineEmits<{ (e: "pet-click"): void }>();
 
 const props = defineProps<{
-  state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away";
+  state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away" | "knock";
   showBell?: boolean;
   reviewBubble?: "reviewing" | "done" | null;
 }>();
 
-const canvas = ref<HTMLCanvasElement | null>(null);
 const isDragging = ref(false);
 
-// Pixel cat sprite - drawn procedurally since we don't have sprite files yet
-const FRAME_SIZE = 64;
-const SCALE = 2;
-const CANVAS_SIZE = FRAME_SIZE * SCALE;
-
-let animFrame = 0;
-let frameCounter = 0;
-let animTimer: number | null = null;
-
-const stateColors: Record<string, string> = {
-  idle: "#666666",
-  busy: "#ff8800",
-  success: "#44bb44",
-  fail: "#dd4444",
-  sleep: "#8888cc",
-  waiting_auth: "#ddaa00",
-  away: "#8888cc",
+// Map states to sprites
+const spriteMap: Record<string, string> = {
+  idle: "/idle.gif",
+  busy: "/busy.gif",
+  success: "/happy.gif",
+  fail: "/fail.gif",
+  sleep: "/cat.png",
+  waiting_auth: "/question.gif",
+  knock: "/question.gif",
+  away: "/cat.png",
 };
 
-function drawCat(ctx: CanvasRenderingContext2D, state: string, frame: number) {
-  ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-  ctx.imageSmoothingEnabled = false;
+// Force GIF restart on state change by appending cache-buster
+const gifKey = ref(0);
+const spriteSrc = computed(() => {
+  const base = spriteMap[props.state] || spriteMap.idle;
+  return `${base}?v=${gifKey.value}`;
+});
 
-  const s = SCALE;
-  const color = stateColors[state] || stateColors.idle;
+watch(() => props.state, () => {
+  gifKey.value++;
+});
 
-  // Body bounce for animation
-  const isStill = state === "sleep" || state === "away";
-  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
-  const baseY = 30 * s + bounce;
+// Drag support — only start dragging after actual mouse movement
+function onMouseDown(e: MouseEvent) {
+  if (e.button !== 0) return;
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const threshold = 5;
 
-  ctx.fillStyle = color;
-
-  // Ears
-  drawPixelRect(ctx, 18 * s, baseY - 16 * s, 6 * s, 8 * s);
-  drawPixelRect(ctx, 38 * s, baseY - 16 * s, 6 * s, 8 * s);
-
-  // Head
-  drawPixelRect(ctx, 14 * s, baseY - 10 * s, 34 * s, 20 * s);
-
-  // Body
-  drawPixelRect(ctx, 16 * s, baseY + 10 * s, 30 * s, 20 * s);
-
-  // Legs
-  const legAnim = state === "busy" ? Math.sin(frame * 1.5) * 3 * s : 0;
-  drawPixelRect(ctx, 18 * s, baseY + 30 * s + legAnim, 8 * s, 10 * s);
-  drawPixelRect(ctx, 36 * s, baseY + 30 * s - legAnim, 8 * s, 10 * s);
-
-  // Tail
-  const tailWag = Math.sin(frame * 0.8) * 5 * s;
-  drawPixelRect(ctx, 46 * s, baseY + 14 * s + tailWag, 6 * s, 4 * s);
-  drawPixelRect(ctx, 50 * s, baseY + 10 * s + tailWag, 4 * s, 8 * s);
-
-  // Eyes
-  ctx.fillStyle = "#ffffff";
-  if (state === "sleep" || state === "away") {
-    // Closed eyes (lines)
-    ctx.fillStyle = "#333333";
-    drawPixelRect(ctx, 22 * s, baseY - 2 * s, 6 * s, 2 * s);
-    drawPixelRect(ctx, 34 * s, baseY - 2 * s, 6 * s, 2 * s);
-  } else {
-    // Open eyes
-    drawPixelRect(ctx, 22 * s, baseY - 6 * s, 6 * s, 6 * s);
-    drawPixelRect(ctx, 34 * s, baseY - 6 * s, 6 * s, 6 * s);
-    // Pupils
-    ctx.fillStyle = "#333333";
-    const pupilOffset = state === "busy" ? Math.sin(frame * 2) * s : 0;
-    drawPixelRect(ctx, 24 * s + pupilOffset, baseY - 4 * s, 3 * s, 3 * s);
-    drawPixelRect(ctx, 36 * s + pupilOffset, baseY - 4 * s, 3 * s, 3 * s);
-  }
-
-  // Mouth
-  ctx.fillStyle = "#333333";
-  if (state === "success") {
-    // Smile
-    drawPixelRect(ctx, 26 * s, baseY + 4 * s, 10 * s, 2 * s);
-    drawPixelRect(ctx, 24 * s, baseY + 2 * s, 2 * s, 2 * s);
-    drawPixelRect(ctx, 36 * s, baseY + 2 * s, 2 * s, 2 * s);
-  } else if (state === "fail") {
-    // Frown
-    drawPixelRect(ctx, 26 * s, baseY + 2 * s, 10 * s, 2 * s);
-    drawPixelRect(ctx, 24 * s, baseY + 4 * s, 2 * s, 2 * s);
-    drawPixelRect(ctx, 36 * s, baseY + 4 * s, 2 * s, 2 * s);
-  } else {
-    // Neutral
-    drawPixelRect(ctx, 28 * s, baseY + 2 * s, 6 * s, 2 * s);
-  }
-
-  // State-specific effects
-  if (state === "busy") {
-    // Sweat drops
-    ctx.fillStyle = "#88ccff";
-    drawPixelRect(ctx, 50 * s, baseY - 8 * s + (frame % 4) * 2 * s, 3 * s, 3 * s);
-  }
-
-  if (state === "sleep") {
-    // ZZZ
-    ctx.fillStyle = "#aaaacc";
-    const zOffset = (frame % 6) * s;
-    ctx.font = `${10 * s}px monospace`;
-    ctx.fillText("z", 48 * s, baseY - 4 * s - zOffset);
-    ctx.font = `${8 * s}px monospace`;
-    ctx.fillText("z", 52 * s, baseY - 12 * s - zOffset);
-  }
-
-  if (state === "away") {
-    // Hanging signboard from cat's neck
-    // String from neck
-    ctx.fillStyle = "#996633";
-    drawPixelRect(ctx, 30 * s, baseY + 12 * s, 2 * s, 10 * s);
-
-    // Signboard background
-    const signX = 16 * s;
-    const signY = baseY + 22 * s;
-    const signW = 30 * s;
-    const signH = 16 * s;
-
-    // Board shadow
-    ctx.fillStyle = "#7a5522";
-    drawPixelRect(ctx, signX + 1 * s, signY + 1 * s, signW, signH);
-
-    // Board
-    ctx.fillStyle = "#c8946a";
-    drawPixelRect(ctx, signX, signY, signW, signH);
-
-    // Board border
-    ctx.fillStyle = "#996633";
-    drawPixelRect(ctx, signX, signY, signW, 2 * s); // top
-    drawPixelRect(ctx, signX, signY + signH - 2 * s, signW, 2 * s); // bottom
-    drawPixelRect(ctx, signX, signY, 2 * s, signH); // left
-    drawPixelRect(ctx, signX + signW - 2 * s, signY, 2 * s, signH); // right
-
-    // Text "外出" on the sign
-    ctx.fillStyle = "#3d2200";
-    ctx.font = `bold ${6 * s}px sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText("外出", signX + signW / 2, signY + signH / 2 + 1 * s);
-    ctx.textAlign = "start";
-    ctx.textBaseline = "alphabetic";
-
-    // Small swing animation on the string
-    const swing = Math.sin(frame * 0.3) * 1 * s;
-    ctx.fillStyle = "#996633";
-    drawPixelRect(ctx, 30 * s + swing, baseY + 18 * s, 2 * s, 4 * s);
-  }
-
-  if (state === "waiting_auth") {
-    // Blinking question mark
-    ctx.fillStyle = frame % 4 < 3 ? "#ffdd00" : "#ff8800";
-    ctx.font = `bold ${12 * s}px monospace`;
-    ctx.fillText("?", 48 * s, baseY - 6 * s);
-  }
-}
-
-function drawBell(ctx: CanvasRenderingContext2D, state: string, frame: number) {
-  const s = SCALE;
-  const isStill = state === "sleep" || state === "away";
-  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
-  const baseY = 30 * s + bounce;
-
-  // Bell hangs from cat's neck, slightly to the right
-  const bellX = 32 * s;
-  const bellY = baseY + 10 * s;
-
-  // Gentle swing
-  const swing = Math.sin(frame * 0.6) * 1.5 * s;
-
-  // String
-  ctx.fillStyle = "#aa8833";
-  drawPixelRect(ctx, bellX + swing * 0.5, bellY, 1 * s, 4 * s);
-
-  // Bell body (golden)
-  ctx.fillStyle = "#ffcc00";
-  drawPixelRect(ctx, bellX - 3 * s + swing, bellY + 4 * s, 7 * s, 5 * s);
-  drawPixelRect(ctx, bellX - 2 * s + swing, bellY + 3 * s, 5 * s, 2 * s);
-
-  // Bell rim (darker gold)
-  ctx.fillStyle = "#dd9900";
-  drawPixelRect(ctx, bellX - 3 * s + swing, bellY + 8 * s, 7 * s, 2 * s);
-
-  // Bell clapper (dark dot)
-  ctx.fillStyle = "#885500";
-  drawPixelRect(ctx, bellX + swing, bellY + 9 * s, 1 * s, 2 * s);
-
-  // Highlight (shine)
-  ctx.fillStyle = "#ffee88";
-  drawPixelRect(ctx, bellX - 1 * s + swing, bellY + 5 * s, 2 * s, 2 * s);
-}
-
-function drawReviewBubble(ctx: CanvasRenderingContext2D, state: string, frame: number) {
-  const s = SCALE;
-  const isStill = state === "sleep" || state === "away";
-  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
-
-  // Bubble position: right side of cat head
-  const bx = 52 * s;
-  const by = 14 * s + bounce;
-
-  // Speech bubble background
-  ctx.fillStyle = "rgba(50, 50, 70, 0.9)";
-  drawPixelRect(ctx, bx, by, 22 * s, 12 * s);
-  drawPixelRect(ctx, bx + 2 * s, by - 1 * s, 18 * s, 14 * s);
-  // Bubble tail (pointing left toward cat)
-  drawPixelRect(ctx, bx - 2 * s, by + 4 * s, 3 * s, 3 * s);
-
-  // Animated dots "..."
-  const dotCount = (frame % 12);
-  ctx.fillStyle = "#88bbff";
-  for (let i = 0; i < 3; i++) {
-    if (dotCount >= i * 3) {
-      const alpha = dotCount >= (i + 1) * 3 ? 1.0 : 0.5;
-      ctx.globalAlpha = alpha;
-      drawPixelRect(ctx, bx + (5 + i * 5) * s, by + 4 * s, 3 * s, 3 * s);
+  function onMove(me: MouseEvent) {
+    if (Math.abs(me.clientX - startX) + Math.abs(me.clientY - startY) > threshold) {
+      cleanup();
+      isDragging.value = true;
+      getCurrentWindow().startDragging().then(() => { isDragging.value = false; });
     }
   }
-  ctx.globalAlpha = 1.0;
-}
 
-function drawLightBulb(ctx: CanvasRenderingContext2D, state: string, frame: number) {
-  const s = SCALE;
-  const isStill = state === "sleep" || state === "away";
-  const bounce = isStill ? 0 : Math.sin(frame * 0.5) * s;
-
-  // Bulb position: right side of cat head
-  const bx = 54 * s;
-  const by = 10 * s + bounce;
-
-  // Glow pulse
-  const glow = 0.3 + Math.sin(frame * 0.4) * 0.15;
-  ctx.fillStyle = `rgba(255, 230, 100, ${glow})`;
-  drawPixelRect(ctx, bx - 3 * s, by - 3 * s, 14 * s, 14 * s);
-
-  // Bulb body (yellow)
-  ctx.fillStyle = "#ffdd44";
-  drawPixelRect(ctx, bx, by, 8 * s, 8 * s);
-  drawPixelRect(ctx, bx + 1 * s, by - 1 * s, 6 * s, 1 * s);
-
-  // Bulb base (gray)
-  ctx.fillStyle = "#999999";
-  drawPixelRect(ctx, bx + 2 * s, by + 8 * s, 4 * s, 3 * s);
-
-  // Filament highlight
-  ctx.fillStyle = "#ffffff";
-  drawPixelRect(ctx, bx + 3 * s, by + 2 * s, 2 * s, 3 * s);
-}
-
-function drawPixelRect(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number
-) {
-  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
-}
-
-function animate() {
-  if (!canvas.value) return;
-  const ctx = canvas.value.getContext("2d");
-  if (!ctx) return;
-
-  frameCounter++;
-  if (frameCounter >= 8) {
-    frameCounter = 0;
-    animFrame++;
+  function onUp() {
+    cleanup();
+    // No movement — it's a click
+    emit("pet-click");
+    if (props.state !== "waiting_auth" && props.reviewBubble !== "done") {
+      setTimeout(() => { invoke("focus_claude_terminal"); }, 50);
+    }
   }
 
-  drawCat(ctx, props.state, animFrame);
-  if (props.showBell) {
-    drawBell(ctx, props.state, animFrame);
+  function cleanup() {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
   }
-  if (props.reviewBubble === "reviewing") {
-    drawReviewBubble(ctx, props.state, animFrame);
-  } else if (props.reviewBubble === "done") {
-    drawLightBulb(ctx, props.state, animFrame);
-  }
-  animTimer = requestAnimationFrame(animate);
+
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
 }
 
-// Drag support
-async function onMouseDown(e: MouseEvent) {
-  if (e.button !== 0) return;
-  isDragging.value = true;
-  const appWindow = getCurrentWindow();
-  await appWindow.startDragging();
-  isDragging.value = false;
-}
-
-watch(
-  () => props.state,
-  () => {
-    animFrame = 0;
-  }
-);
-
+// Bell animation
+const bellFrame = ref(0);
+let bellTimer: number | null = null;
 onMounted(() => {
-  animate();
+  bellTimer = window.setInterval(() => { bellFrame.value++; }, 150);
+});
+onUnmounted(() => {
+  if (bellTimer !== null) clearInterval(bellTimer);
 });
 
-onUnmounted(() => {
-  if (animTimer !== null) {
-    cancelAnimationFrame(animTimer);
-  }
+const bellSwing = computed(() => Math.sin(bellFrame.value * 0.6) * 15);
+
+// Review bubble animation
+const bubbleFrame = ref(0);
+let bubbleTimer: number | null = null;
+onMounted(() => {
+  bubbleTimer = window.setInterval(() => { bubbleFrame.value++; }, 200);
 });
+onUnmounted(() => {
+  if (bubbleTimer !== null) clearInterval(bubbleTimer);
+});
+
+const bubbleDots = computed(() => {
+  const phase = bubbleFrame.value % 4;
+  return ".".repeat(phase);
+});
+
+// Lightbulb glow
+const bulbGlow = computed(() => 0.6 + Math.sin(bubbleFrame.value * 0.4) * 0.4);
+
 </script>
 
 <template>
-  <canvas
-    ref="canvas"
-    :width="CANVAS_SIZE"
-    :height="CANVAS_SIZE"
-    class="pet-canvas"
-    :class="{ 'pet-canvas--auth': state === 'waiting_auth' }"
-    @mousedown="onMouseDown"
-  />
+  <div class="pet-container" :class="{ 'pet-container--auth': state === 'waiting_auth' }" @mousedown="onMouseDown">
+    <!-- Base sprite GIF -->
+    <img
+      :key="gifKey"
+      :src="spriteSrc"
+      class="pet-sprite"
+      draggable="false"
+    />
+
+    <!-- Away overlay: signboard -->
+    <div v-if="state === 'away'" class="overlay overlay--away-sign">
+      外出
+    </div>
+
+    <!-- Bell indicator -->
+    <div v-if="showBell" class="overlay overlay--bell" :style="{ transform: `rotate(${bellSwing}deg)` }">
+      🔔
+    </div>
+
+    <!-- Review bubble: animated dots -->
+    <div v-if="reviewBubble === 'reviewing'" class="overlay overlay--bubble">
+      <span class="bubble-dots">{{ bubbleDots }}</span>
+    </div>
+
+    <!-- Review done: lightbulb -->
+    <div v-if="reviewBubble === 'done'" class="overlay overlay--bulb" :style="{ opacity: bulbGlow }">
+      💡
+    </div>
+  </div>
 </template>
 
 <style scoped>
-.pet-canvas {
+.pet-container {
   position: absolute;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
   cursor: grab;
-  image-rendering: pixelated;
   transition: top 0.2s ease;
+  /* Size to fit sprite + overlays */
+  width: 128px;
+  height: 128px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.pet-canvas--auth {
+.pet-container--auth {
   top: 30%;
 }
 
-.pet-canvas:active {
+.pet-container:active {
   cursor: grabbing;
+}
+
+.pet-sprite {
+  image-rendering: pixelated;
+  width: 102px;
+  height: 102px;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Overlays positioned relative to container */
+.overlay {
+  position: absolute;
+  pointer-events: none;
+  user-select: none;
+}
+
+.overlay--question {
+  top: -8px;
+  right: -4px;
+  font-size: 24px;
+  font-weight: bold;
+  color: #ffdd00;
+  text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+  animation: bounce-q 0.6s ease-in-out infinite;
+}
+
+@keyframes bounce-q {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+.overlay--away-sign {
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #c8946a;
+  border: 2px solid #8B6914;
+  color: #3d2200;
+  font-size: 10px;
+  font-weight: bold;
+  padding: 2px 6px;
+  border-radius: 2px;
+  box-shadow: 1px 1px 0 #6B4E12;
+}
+
+.overlay--bell {
+  top: -20px;
+  right: -16px;
+  font-size: 20px;
+  opacity: 0.8;
+  transform-origin: top center;
+}
+
+.overlay--bubble {
+  top: -4px;
+  right: -12px;
+  background: rgba(50, 50, 70, 0.9);
+  color: #88bbff;
+  font-size: 12px;
+  font-family: monospace;
+  padding: 2px 6px;
+  border-radius: 4px;
+  min-width: 28px;
+  text-align: center;
+}
+
+.bubble-dots {
+  letter-spacing: 2px;
+}
+
+.overlay--bulb {
+  top: -8px;
+  right: -8px;
+  font-size: 18px;
+  transition: opacity 0.3s ease;
 }
 </style>

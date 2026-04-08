@@ -1,3 +1,4 @@
+use crate::plog;
 use crate::claude_session::{ClaudeOutput, ClaudeSession};
 use crate::config::SlackConfig;
 use crate::hook_server::{AuthDecision, PendingRequests, TerminalSession};
@@ -37,7 +38,7 @@ impl SlackBridge {
     pub async fn init(&self) -> Result<(), String> {
         let data = self.api_post("auth.test", &serde_json::json!({})).await?;
         let user_id = data["user_id"].as_str().unwrap_or("").to_string();
-        println!("[Pawkit] Slack bot user ID: {}", user_id);
+        plog!("[Pawkit] Slack bot user ID: {}", user_id);
         *self.bot_user_id.lock().await = user_id;
 
         let data = self
@@ -47,7 +48,7 @@ impl SlackBridge {
         if channel_id.is_empty() {
             return Err("conversations.open returned empty channel ID".to_string());
         }
-        println!("[Pawkit] DM channel ID: {}", channel_id);
+        plog!("[Pawkit] DM channel ID: {}", channel_id);
         *self.dm_channel_id.lock().await = channel_id;
         Ok(())
     }
@@ -428,7 +429,7 @@ pub async fn run_remote_session(
     initial_session: Option<TerminalSession>,
 ) {
     if let Err(e) = slack.init().await {
-        eprintln!("[Pawkit] Slack init failed: {}", e);
+        plog!("[Pawkit] Slack init failed: {}", e);
         is_away.store(false, Ordering::SeqCst);
         return;
     }
@@ -446,7 +447,7 @@ pub async fn run_remote_session(
     )).await {
         Ok(ts) => ts,
         Err(e) => {
-            eprintln!("[Pawkit] Failed to post welcome: {}", e);
+            plog!("[Pawkit] Failed to post welcome: {}", e);
             is_away.store(false, Ordering::SeqCst);
             return;
         }
@@ -458,10 +459,10 @@ pub async fn run_remote_session(
     // find previous Slack sessions (since Slack uses a different working_dir).
     let session = if let Some(ref ts) = initial_session {
         let wd = if ts.working_dir.is_empty() { config.working_dir.clone() } else { ts.working_dir.clone() };
-        println!("[Pawkit] Resuming terminal session: {} (cwd={})", ts.session_id, wd);
+        plog!("[Pawkit] Resuming terminal session: {} (cwd={})", ts.session_id, wd);
         Arc::new(Mutex::new(ClaudeSession::new_resume(ts.session_id.clone(), wd)))
     } else {
-        println!("[Pawkit] No terminal session captured, starting fresh");
+        plog!("[Pawkit] No terminal session captured, starting fresh");
         Arc::new(Mutex::new(ClaudeSession::new(config.working_dir.clone())))
     };
 
@@ -476,11 +477,11 @@ pub async fn run_remote_session(
 
     let listener = tokio::spawn(async move {
         while ws_away.load(Ordering::SeqCst) {
-            println!("[Pawkit] Connecting Socket Mode...");
+            plog!("[Pawkit] Connecting Socket Mode...");
             let ws_url = match ws_slack.connect_socket().await {
                 Ok(url) => url,
                 Err(e) => {
-                    eprintln!("[Pawkit] Socket Mode connect failed: {}", e);
+                    plog!("[Pawkit] Socket Mode connect failed: {}", e);
                     let _ = ws_slack.reply(&format!("⚠️ Socket Mode 连接失败: `{}`", e)).await;
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
@@ -490,13 +491,13 @@ pub async fn run_remote_session(
             let ws_stream = match tokio_tungstenite::connect_async(&ws_url).await {
                 Ok((stream, _)) => stream,
                 Err(e) => {
-                    eprintln!("[Pawkit] WebSocket connect failed: {}", e);
+                    plog!("[Pawkit] WebSocket connect failed: {}", e);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
             };
 
-            println!("[Pawkit] Socket Mode connected!");
+            plog!("[Pawkit] Socket Mode connected!");
             let _ = ws_slack.reply("🔗 已连接").await;
 
             let (mut ws_tx, mut ws_rx) = ws_stream.split();
@@ -509,7 +510,7 @@ pub async fn run_remote_session(
                 let msg = match msg {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("[Pawkit] WebSocket error: {}", e);
+                        plog!("[Pawkit] WebSocket error: {}", e);
                         break;
                     }
                 };
@@ -581,7 +582,7 @@ pub async fn run_remote_session(
                 };
 
                 let preview: String = user_msg.text.chars().take(60).collect();
-                println!("[Pawkit] Message: thread={:?} text={}", user_msg.thread_ts, preview);
+                plog!("[Pawkit] Message: thread={:?} text={}", user_msg.thread_ts, preview);
 
                 let lower = user_msg.text.to_lowercase();
                 let active_thread = ws_slack.get_active_thread().await;
@@ -633,7 +634,7 @@ pub async fn run_remote_session(
                     let new_thread = user_msg.thread_ts.as_deref().unwrap_or(msg_ts);
                     ws_slack.set_active_thread(new_thread).await;
 
-                    println!("[Pawkit] New session, thread={}", new_thread);
+                    plog!("[Pawkit] New session, thread={}", new_thread);
                 }
 
                 let _ = prompt_tx.send(Prompt {
@@ -643,7 +644,7 @@ pub async fn run_remote_session(
             }
 
             if ws_away.load(Ordering::SeqCst) {
-                println!("[Pawkit] Socket disconnected, reconnecting in 2s...");
+                plog!("[Pawkit] Socket disconnected, reconnecting in 2s...");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -715,6 +716,6 @@ pub async fn run_remote_session(
     });
 
     let (listener_res, processor_res) = tokio::join!(listener, processor);
-    println!("[Pawkit] Remote session ended. listener={:?} processor={:?}", listener_res, processor_res);
+    plog!("[Pawkit] Remote session ended. listener={:?} processor={:?}", listener_res, processor_res);
     let _ = slack.reply("🐱 *Pawkit 远程模式已关闭，回家啦~*").await;
 }

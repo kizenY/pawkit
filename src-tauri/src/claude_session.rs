@@ -1,3 +1,4 @@
+use crate::plog;
 use serde::Serialize;
 use tokio::process::Command;
 use std::process::Stdio;
@@ -61,7 +62,7 @@ impl ClaudeSession {
     }
 
     pub async fn run_prompt(&mut self, prompt: &str) -> Result<ClaudeOutput, String> {
-        println!("[Pawkit] run_prompt: resume={:?} dir={} prompt_len={}", self.session_id.as_deref(), self.working_dir, prompt.len());
+        plog!("[Pawkit] run_prompt: resume={:?} dir={} prompt_len={}", self.session_id.as_deref(), self.working_dir, prompt.len());
 
         // Write prompt to temp file, then pipe via `type file | claude`.
         // This avoids cmd.exe mangling special characters (*, `, ", ^, |)
@@ -118,12 +119,12 @@ impl ClaudeSession {
 
                 // Save session ID for --resume on next call
                 if let Some(ref sid) = session_id {
-                    println!("[Pawkit] Claude session_id saved: {}", sid);
+                    plog!("[Pawkit] Claude session_id saved: {}", sid);
                     self.session_id = Some(sid.clone());
                     self.use_continue = false;
                 } else {
-                    println!("[Pawkit] WARNING: no session_id in Claude output");
-                    println!("[Pawkit] JSON keys: {:?}", json.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                    plog!("[Pawkit] WARNING: no session_id in Claude output");
+                    plog!("[Pawkit] JSON keys: {:?}", json.as_object().map(|o| o.keys().collect::<Vec<_>>()));
                 }
 
                 Ok(ClaudeOutput {
@@ -137,7 +138,7 @@ impl ClaudeSession {
             Err(_) => {
                 // JSON parsing failed — treat raw output as plain text result.
                 // This happens when --output-format json doesn't take effect.
-                println!("[Pawkit] WARNING: Claude output is not JSON, using raw text");
+                plog!("[Pawkit] WARNING: Claude output is not JSON, using raw text");
                 Ok(ClaudeOutput {
                     text: trimmed.to_string(),
                     session_id: None,
