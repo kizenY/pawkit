@@ -123,12 +123,11 @@ pub fn is_claude_window_focused() -> bool {
     }
 }
 
-/// Focus the terminal window associated with a specific Claude process PID.
 /// Focus the terminal window for a specific Claude session.
-/// Each session runs in its own terminal window (wt -w new).
-/// Toggle: click once → show, click again → minimize.
-/// Excludes Pawkit's own PID so headless child processes (auto_review)
-/// don't accidentally toggle Pawkit's window.
+/// Sessions share one terminal window as tabs. Behavior:
+/// - Terminal focused + same session tab → minimize
+/// - Terminal focused + different session → switch to session's tab
+/// - Terminal not focused/minimized → restore + switch to session's tab
 #[cfg(target_os = "windows")]
 pub fn focus_session_terminal(claude_pid: u32, is_same_session: bool) -> bool {
     let my_pid = std::process::id();
@@ -136,16 +135,24 @@ pub fn focus_session_terminal(claude_pid: u32, is_same_session: bool) -> bool {
         .into_iter()
         .filter(|&pid| pid != my_pid)
         .collect();
-    plog!("[Pawkit] focus_session_terminal: claude_pid={} is_same={}", claude_pid, is_same_session);
     if let Some(hwnd) = find_window_by_pid_set(&ancestors) {
-        plog!("[Pawkit] focus_session_terminal: hwnd={}", hwnd);
+        let tab_index = find_tab_index(hwnd, claude_pid);
+        plog!("[Pawkit] focus_session_terminal: pid={} hwnd={} tab={:?} same={}", claude_pid, hwnd, tab_index, is_same_session);
         unsafe {
             let fg = GetForegroundWindow();
             if fg == hwnd && is_same_session {
+                // Same cat clicked again while terminal is focused → minimize
                 plog!("[Pawkit] focus_session_terminal: minimize");
                 ShowWindow(hwnd, SW_MINIMIZE);
+            } else if fg == hwnd {
+                // Terminal focused but different cat → switch tab
+                plog!("[Pawkit] focus_session_terminal: switch tab");
+                if let Some(idx) = tab_index {
+                    send_tab_switch(idx);
+                }
             } else {
-                plog!("[Pawkit] focus_session_terminal: bring to front");
+                // Terminal not focused → restore + switch tab
+                plog!("[Pawkit] focus_session_terminal: restore + switch tab");
                 let my_thread = GetCurrentThreadId();
                 let mut target_pid: u32 = 0;
                 let target_thread = GetWindowThreadProcessId(hwnd, &mut target_pid);
@@ -153,12 +160,66 @@ pub fn focus_session_terminal(claude_pid: u32, is_same_session: bool) -> bool {
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
                 AttachThreadInput(my_thread, target_thread, 0);
+                if let Some(idx) = tab_index {
+                    // Delay to let window fully restore before sending keys
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        send_tab_switch(idx);
+                    });
+                }
             }
         }
         return true;
     }
     plog!("[Pawkit] focus_session_terminal: no window found for pid={}", claude_pid);
     false
+}
+
+/// Switch Windows Terminal tab via SendInput (Ctrl+Alt+N).
+#[cfg(target_os = "windows")]
+fn send_tab_switch(tab_index: usize) {
+    if tab_index >= 9 { return; }
+    plog!("[Pawkit] send_tab_switch: Ctrl+Alt+{}", tab_index + 1);
+
+    extern "system" {
+        fn SendInput(count: u32, inputs: *const RawInput, size: i32) -> u32;
+    }
+
+    // INPUT struct on x64: type(4) + pad(4) + union(32) = 40 bytes
+    #[repr(C)]
+    struct RawInput {
+        type_: u32,
+        _pad0: u32,
+        vk: u16,
+        scan: u16,
+        flags: u32,
+        time: u32,
+        _pad1: u32,
+        extra_info: usize,
+        _pad2: [u8; 8],
+    }
+
+    fn key(vk: u16, flags: u32) -> RawInput {
+        RawInput {
+            type_: 1, _pad0: 0, vk, scan: 0, flags, time: 0,
+            _pad1: 0, extra_info: 0, _pad2: [0; 8],
+        }
+    }
+
+    let vk_num = 0x31 + tab_index as u16; // VK_1 = 0x31
+    let inputs = [
+        key(0x11, 0),            // Ctrl down
+        key(0x12, 0),            // Alt down
+        key(vk_num, 0),          // Number down
+        key(vk_num, 0x0002),     // Number up
+        key(0x12, 0x0002),       // Alt up
+        key(0x11, 0x0002),       // Ctrl up
+    ];
+
+    let sent = unsafe {
+        SendInput(6, inputs.as_ptr(), std::mem::size_of::<RawInput>() as i32)
+    };
+    plog!("[Pawkit] send_tab_switch: sent {}/6", sent);
 }
 
 /// Toggle a window: if already foreground -> minimize, otherwise -> bring to front.

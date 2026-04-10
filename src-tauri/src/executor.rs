@@ -257,7 +257,7 @@ fn execute_claude(action: &Action) -> ExecResult {
         const DETACHED_PROCESS: u32 = 0x00000008;
         let mut cmd = Command::new("wt");
         let raw = format!(
-            r#"new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
+            r#"-w 0 new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
             workdir = workdir,
             bash = bash_path,
         );
@@ -447,7 +447,7 @@ pub fn launch_resume_terminal(session_id: &str, working_dir: &str) -> Result<(),
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x00000008;
         let raw = format!(
-            r#"new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude --resume {sid}""#,
+            r#"-w 0 new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude --resume {sid}""#,
             workdir = workdir,
             bash = bash_path,
             sid = session_id,
