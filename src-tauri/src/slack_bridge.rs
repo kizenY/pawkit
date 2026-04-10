@@ -2,6 +2,7 @@ use crate::plog;
 use crate::claude_session::{ClaudeOutput, ClaudeSession};
 use crate::config::SlackConfig;
 use crate::hook_server::{AuthDecision, PendingRequests, TerminalSession};
+use crate::session_store::{SessionRecord, SessionSource, SessionStore};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -427,6 +428,8 @@ pub async fn run_remote_session(
     is_away: Arc<AtomicBool>,
     config: SlackConfig,
     initial_session: Option<TerminalSession>,
+    session_store: Arc<Mutex<SessionStore>>,
+    green_light: Arc<AtomicBool>,
 ) {
     if let Err(e) = slack.init().await {
         plog!("[Pawkit] Slack init failed: {}", e);
@@ -442,7 +445,8 @@ pub async fn run_remote_session(
          _在此 thread 中继续最近的会话_\n\
          _(先退出终端 Claude Code 再外出，确保会话能被继承)_\n\n\
          新消息(非thread回复) = 新建会话\n\
-         `!ping` `!cd` `!stop` `!auto on/off`",
+         `!ping` `!cd` `!stop` `!auto on/off` `!green on/off`\n\
+         `/btw <msg>` 追加消息到当前会话",
         config.working_dir
     )).await {
         Ok(ts) => ts,
@@ -468,12 +472,15 @@ pub async fn run_remote_session(
 
     let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<Prompt>(32);
     let auto_approve = Arc::new(AtomicBool::new(false));
+    let btw_queue: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     // --- Task 1: Socket Mode listener ---
     let ws_slack = slack.clone();
     let ws_pending = pending.clone();
     let ws_away = is_away.clone();
     let ws_auto = auto_approve.clone();
+    let ws_green = green_light.clone();
+    let ws_btw = btw_queue.clone();
 
     let listener = tokio::spawn(async move {
         while ws_away.load(Ordering::SeqCst) {
@@ -602,6 +609,25 @@ pub async fn run_remote_session(
                     let _ = ws_slack.reply("🔒 自动审批已关闭").await;
                     continue;
                 }
+                if lower == "!green on" {
+                    ws_green.store(true, Ordering::SeqCst);
+                    let _ = ws_slack.reply("🟢 绿灯模式已开启").await;
+                    continue;
+                }
+                if lower == "!green off" {
+                    ws_green.store(false, Ordering::SeqCst);
+                    let _ = ws_slack.reply("🔴 绿灯模式已关闭").await;
+                    continue;
+                }
+                // /btw command: queue message for current session
+                if lower.starts_with("/btw ") {
+                    let btw_text = user_msg.text[5..].trim().to_string();
+                    if !btw_text.is_empty() {
+                        ws_btw.lock().await.push(btw_text);
+                        let _ = ws_slack.reply("📝 已记录，会在当前任务完成后转达").await;
+                    }
+                    continue;
+                }
                 if (lower == "allow" || lower == "y" || lower == "deny" || lower == "n")
                     && has_pending_auth(&ws_pending).await
                 {
@@ -654,6 +680,8 @@ pub async fn run_remote_session(
     let proc_slack = slack.clone();
     let proc_session = session.clone();
     let proc_away = is_away.clone();
+    let proc_store = session_store.clone();
+    let proc_btw = btw_queue.clone();
 
     let processor = tokio::spawn(async move {
         while let Some(prompt) = prompt_rx.recv().await {
@@ -702,6 +730,35 @@ pub async fn run_remote_session(
 
             match result {
                 Ok(output) => {
+                    // Track session in store
+                    if let Some(ref sid) = output.session_id {
+                        let thread_ts = proc_slack.get_active_thread().await;
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let mut store = proc_store.lock().await;
+                        if store.by_id(sid).is_none() {
+                            // First output for this session — register & post session ID
+                            let title = crate::session_store::generate_title(sid);
+                            let wd = proc_session.lock().await.working_dir().to_string();
+                            store.upsert(SessionRecord {
+                                session_id: sid.clone(),
+                                title: title.clone(),
+                                working_dir: wd,
+                                created_at: now,
+                                last_active: now,
+                                source: SessionSource::Slack,
+                                slack_thread_ts: if thread_ts.is_empty() { None } else { Some(thread_ts) },
+                                total_cost_usd: output.cost_usd.unwrap_or(0.0),
+                            });
+                            let _ = proc_slack.reply(&format!("_sid: `{}`_", &sid[..sid.len().min(8)])).await;
+                        } else {
+                            store.touch(sid);
+                            if let Some(cost) = output.cost_usd {
+                                store.add_cost(sid, cost);
+                            }
+                            store.save();
+                        }
+                    }
+
                     if output.is_error {
                         let _ = proc_slack.reply(&format!("⚠️ Claude 返回错误:\n```\n{}\n```", output.text)).await;
                     } else {
@@ -710,6 +767,35 @@ pub async fn run_remote_session(
                 }
                 Err(e) => {
                     let _ = proc_slack.reply(&format!("❌ 执行失败:\n```\n{}\n```", e)).await;
+                }
+            }
+
+            // F8: Process queued /btw messages after each prompt completes
+            let btw_messages: Vec<String> = {
+                let mut q = proc_btw.lock().await;
+                q.drain(..).collect()
+            };
+            if !btw_messages.is_empty() {
+                let follow_up = format!(
+                    "BTW, the user wanted to add this context:\n{}",
+                    btw_messages.join("\n---\n")
+                );
+                let _ = proc_slack.reply(&format!("📝 转达中: _{}_", btw_messages.join("; "))).await;
+                let _ = proc_slack.set_status("🤔 thinking about btw...").await;
+                let mut session = proc_session.lock().await;
+                match session.run_prompt(&follow_up).await {
+                    Ok(output) => {
+                        let _ = proc_slack.clear_status().await;
+                        if output.is_error {
+                            let _ = proc_slack.reply(&format!("⚠️ {}", output.text)).await;
+                        } else {
+                            post_claude_output(&proc_slack, &output).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proc_slack.clear_status().await;
+                        let _ = proc_slack.reply(&format!("❌ btw 执行失败: {}", e)).await;
+                    }
                 }
             }
         }

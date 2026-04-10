@@ -9,6 +9,8 @@
     "core:window:allow-set-focus",
     "core:window:allow-show",
     "core:window:allow-hide",
+    "core:window:allow-set-size",
+    "core:window:allow-set-always-on-top",
     "core:event:default",
     "opener:default",
     "shell:default"

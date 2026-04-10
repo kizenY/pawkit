@@ -304,13 +304,13 @@ async fn poll_github(
 ) -> Result<(), String> {
     plog!("[Pawkit] Polling GitHub notifications...");
 
-    // Use all=true to include read notifications (new activity changes updated_at,
-    // caught by seen set). participating=true limits to threads we're involved in.
+    // Only fetch unread notifications. GitHub automatically marks notifications as
+    // unread again when there's new activity, so we don't miss updates.
+    // Using all=true would incorrectly re-surface already-read notifications.
     let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let resp = client
         .get("https://api.github.com/notifications")
         .query(&[
-            ("all", "true"),
             ("participating", "true"),
             ("since", since.as_str()),
             ("per_page", "50"),

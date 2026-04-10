@@ -9,9 +9,15 @@ const props = defineProps<{
   state: "idle" | "busy" | "success" | "fail" | "sleep" | "waiting_auth" | "away" | "knock";
   showBell?: boolean;
   reviewBubble?: "reviewing" | "done" | null;
+  title?: string;
+  size?: number;
+  isIdleCat?: boolean;
+  showGreenDot?: boolean;
+  sessionId?: string;
 }>();
 
 const isDragging = ref(false);
+const spriteSize = computed(() => props.size || 102);
 
 // Map states to sprites
 const spriteMap: Record<string, string> = {
@@ -56,7 +62,7 @@ function onMouseDown(e: MouseEvent) {
     // No movement — it's a click
     emit("pet-click");
     if (props.state !== "waiting_auth" && props.reviewBubble !== "done") {
-      setTimeout(() => { invoke("focus_claude_terminal"); }, 50);
+      setTimeout(() => { invoke("focus_claude_terminal", { sessionId: props.sessionId || null }); }, 50);
     }
   }
 
@@ -102,12 +108,16 @@ const bulbGlow = computed(() => 0.6 + Math.sin(bubbleFrame.value * 0.4) * 0.4);
 </script>
 
 <template>
-  <div class="pet-container" :class="{ 'pet-container--auth': state === 'waiting_auth' }" @mousedown="onMouseDown">
+  <div class="pet-container" :class="{ 'pet-container--auth': state === 'waiting_auth' && isIdleCat }" @mousedown="onMouseDown">
+    <!-- Session title label above cat -->
+    <div v-if="title && !isIdleCat" class="cat-title">{{ title }}</div>
+
     <!-- Base sprite GIF -->
     <img
       :key="gifKey"
       :src="spriteSrc"
       class="pet-sprite"
+      :style="{ width: spriteSize + 'px', height: spriteSize + 'px' }"
       draggable="false"
     />
 
@@ -115,6 +125,9 @@ const bulbGlow = computed(() => 0.6 + Math.sin(bubbleFrame.value * 0.4) * 0.4);
     <div v-if="state === 'away'" class="overlay overlay--away-sign">
       外出
     </div>
+
+    <!-- Green light indicator -->
+    <div v-if="showGreenDot" class="overlay overlay--green-dot"></div>
 
     <!-- Bell indicator -->
     <div v-if="showBell" class="overlay overlay--bell" :style="{ transform: `rotate(${bellSwing}deg)` }">
@@ -135,32 +148,41 @@ const bulbGlow = computed(() => 0.6 + Math.sin(bubbleFrame.value * 0.4) * 0.4);
 
 <style scoped>
 .pet-container {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+  position: relative;
   cursor: grab;
-  transition: top 0.2s ease;
-  /* Size to fit sprite + overlays */
-  width: 128px;
-  height: 128px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
 }
 
 .pet-container--auth {
-  top: 30%;
+  margin-top: -20%;
 }
 
 .pet-container:active {
   cursor: grabbing;
 }
 
+.cat-title {
+  font-size: 10px;
+  font-family: monospace;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(0, 0, 0, 0.5);
+  padding: 1px 4px;
+  border-radius: 3px;
+  margin-bottom: 2px;
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  pointer-events: none;
+  user-select: none;
+}
+
 .pet-sprite {
   image-rendering: pixelated;
-  width: 102px;
-  height: 102px;
   object-fit: contain;
   pointer-events: none;
   user-select: none;
@@ -200,6 +222,17 @@ const bulbGlow = computed(() => 0.6 + Math.sin(bubbleFrame.value * 0.4) * 0.4);
   padding: 2px 6px;
   border-radius: 2px;
   box-shadow: 1px 1px 0 #6B4E12;
+}
+
+.overlay--green-dot {
+  bottom: 2px;
+  left: 2px;
+  width: 8px;
+  height: 8px;
+  background: #22c55e;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.3);
+  box-shadow: 0 0 4px rgba(34, 197, 94, 0.6);
 }
 
 .overlay--bell {
