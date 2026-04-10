@@ -1,4 +1,5 @@
 use crate::config::Action;
+use crate::plog;
 use serde::Serialize;
 use std::process::Command;
 
@@ -221,6 +222,8 @@ fn execute_pipeline(action: &Action) -> ExecResult {
 }
 
 fn execute_claude(action: &Action) -> ExecResult {
+    plog!("[execute_claude] action={}, workdir={:?}", action.id, action.workdir);
+
     let workdir = action.workdir.as_deref()
         .map(|w| resolve_env_vars(w))
         .unwrap_or_else(|| {
@@ -228,6 +231,8 @@ fn execute_claude(action: &Action) -> ExecResult {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         });
+
+    plog!("[execute_claude] resolved workdir={}", workdir);
 
     // Validate workdir to prevent command injection — reject characters that
     // could break out of shell quoting on any platform.
@@ -243,17 +248,35 @@ fn execute_claude(action: &Action) -> ExecResult {
 
     #[cfg(target_os = "windows")]
     {
+        plog!("[execute_claude] finding git bash...");
         let bash_path = find_git_bash()
             .ok_or("Cannot find git-bash. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")?;
+        plog!("[execute_claude] git bash found: {}", bash_path);
 
         use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("cmd");
-        cmd.raw_arg(format!(
-            r#"/C start "" wt -d "{workdir}" cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        let mut cmd = Command::new("wt");
+        let raw = format!(
+            r#"new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
             workdir = workdir,
             bash = bash_path,
-        ));
-        return run_command(cmd);
+        );
+        plog!("[execute_claude] spawning: wt {}", raw);
+        cmd.raw_arg(&raw);
+        cmd.creation_flags(DETACHED_PROCESS);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => {
+                plog!("[execute_claude] wt spawned successfully");
+                return Ok((String::new(), String::new(), Some(0)));
+            }
+            Err(e) => {
+                plog!("[execute_claude] wt spawn FAILED: {}", e);
+                return Err(format!("Failed to launch terminal: {}", e));
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -291,24 +314,84 @@ fn find_git_bash() -> Option<String> {
         }
     }
 
-    // 2. Check PATH — prefer Git-bundled bash over WSL/store aliases
+    // 2. Check cached path from a previous successful discovery
+    let cache_path = dirs::config_dir()
+        .map(|d| d.join("pawkit").join(".git_bash_path"));
+    if let Some(ref cache) = cache_path {
+        if let Ok(cached) = std::fs::read_to_string(cache) {
+            let cached = cached.trim().to_string();
+            if !cached.is_empty() && Path::new(&cached).exists() {
+                return Some(cached);
+            }
+        }
+    }
+
+    // 3. Check PATH — prefer Git-bundled bash over WSL/store aliases
     if let Ok(output) = Command::new("where").arg("bash").output() {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let path = line.trim();
-                // Skip WSL and Windows Store bash
                 if path.contains(r"\Windows\") || path.contains("WindowsApps") {
                     continue;
                 }
                 if Path::new(path).exists() {
+                    cache_git_bash(&cache_path, path);
                     return Some(path.to_string());
                 }
             }
         }
     }
 
-    // 3. Check common locations
+    // 4. Check Windows registry for Git install path
+    for key_path in &[
+        r"SOFTWARE\GitForWindows",
+        r"SOFTWARE\WOW6432Node\GitForWindows",
+    ] {
+        if let Ok(output) = Command::new("reg")
+            .args(["query", &format!(r"HKLM\{}", key_path), "/v", "InstallPath"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(idx) = line.find("REG_SZ") {
+                    let install_dir = line[idx + 6..].trim();
+                    for sub in &[r"usr\bin\bash.exe", r"bin\bash.exe"] {
+                        let candidate = format!(r"{}\{}", install_dir, sub);
+                        if Path::new(&candidate).exists() {
+                            cache_git_bash(&cache_path, &candidate);
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Try to locate bash via git.exe (git --exec-path → derive install dir)
+    if let Ok(output) = Command::new("where").arg("git").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let git_path = Path::new(line.trim());
+                // git.exe is typically in Git/cmd/ or Git/mingw64/bin/ — walk up to Git root
+                if let Some(git_dir) = git_path.parent() {
+                    if let Some(git_root) = git_dir.parent() {
+                        for sub in &[r"usr\bin\bash.exe", r"bin\bash.exe"] {
+                            let candidate = git_root.join(sub);
+                            if candidate.exists() {
+                                let s = candidate.to_string_lossy().to_string();
+                                cache_git_bash(&cache_path, &s);
+                                return Some(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Check common locations
     let candidates = [
         r"C:\Program Files\Git\bin\bash.exe",
         r"C:\Program Files\Git\usr\bin\bash.exe",
@@ -316,11 +399,19 @@ fn find_git_bash() -> Option<String> {
     ];
     for candidate in &candidates {
         if Path::new(candidate).exists() {
+            cache_git_bash(&cache_path, candidate);
             return Some(candidate.to_string());
         }
     }
 
     None
+}
+
+#[cfg(target_os = "windows")]
+fn cache_git_bash(cache_path: &Option<std::path::PathBuf>, bash_path: &str) {
+    if let Some(ref path) = cache_path {
+        let _ = std::fs::write(path, bash_path);
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

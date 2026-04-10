@@ -370,21 +370,8 @@ fn build_tray_menu(
                 "_tray_quit" => {
                     app.exit(0);
                 }
-                id if id.starts_with("_") => {}
-                _ => {
-                    let action = {
-                        let config = tray_config.lock().unwrap();
-                        config.actions.actions.iter().find(|a| a.id == *id).cloned()
-                    };
-                    if let Some(action) = action {
-                        let app_handle = app.clone();
-                        let _ = app_handle.emit("action_started", &action.id);
-                        std::thread::spawn(move || {
-                            let result = execute_action(&action);
-                            let _ = app_handle.emit("action_finished", &result);
-                        });
-                    }
-                }
+                // Action items are handled by app.on_menu_event() to avoid double execution
+                _ => {}
             }
         })
         .build(app)?;
@@ -394,8 +381,15 @@ fn build_tray_menu(
 
 /// Rebuild the tray menu after config changes
 fn rebuild_tray_menu(app_handle: &tauri::AppHandle, shared_config: &SharedConfig) {
-    let config = shared_config.lock().unwrap();
-    match create_tray_menu(app_handle, &config) {
+    // Build the menu while holding the lock, then release before set_menu().
+    // set_menu() dispatches to the main thread — holding the lock here would
+    // deadlock if the main thread is also waiting on the same mutex (e.g. in
+    // on_menu_event).
+    let menu_result = {
+        let config = shared_config.lock().unwrap();
+        create_tray_menu(app_handle, &config)
+    };
+    match menu_result {
         Ok(menu) => {
             if let Some(tray) = app_handle.tray_by_id("main_tray") {
                 let _ = tray.set_menu(Some(menu));
@@ -418,7 +412,13 @@ fn start_config_watcher(app_handle: tauri::AppHandle, shared_config: SharedConfi
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
             if let Ok(event) = res {
                 if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                    let _ = tx.send(());
+                    // Only react to YAML config files — ignore log files and other writes
+                    let is_yaml = event.paths.iter().any(|p| {
+                        p.extension().map_or(false, |ext| ext == "yaml" || ext == "yml")
+                    });
+                    if is_yaml {
+                        let _ = tx.send(());
+                    }
                 }
             }
         })
@@ -642,18 +642,26 @@ pub fn run() {
                 }
 
                 // Find and execute the action
+                plog!("[menu_event] looking up action id={}", id);
                 let action = {
                     let config = menu_config.lock().unwrap();
                     config.actions.actions.iter().find(|a| a.id == id).cloned()
                 };
 
                 if let Some(action) = action {
+                    plog!("[menu_event] executing action: {} (type={})", action.id, action.action_type);
                     let app_handle = app.clone();
                     let _ = app_handle.emit("action_started", &action.id);
                     std::thread::spawn(move || {
                         let result = execute_action(&action);
+                        plog!("[menu_event] action finished: {} success={}", result.action_id, result.success);
+                        if !result.stderr.is_empty() {
+                            plog!("[menu_event] stderr: {}", result.stderr);
+                        }
                         let _ = app_handle.emit("action_finished", &result);
                     });
+                } else {
+                    plog!("[menu_event] action not found for id={}", id);
                 }
             });
 
