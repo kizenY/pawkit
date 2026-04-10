@@ -172,6 +172,14 @@ fn get_hook_port() -> u16 {
 }
 
 #[tauri::command]
+async fn get_active_sessions(
+    active_sessions: tauri::State<'_, hook_server::ActiveSessions>,
+) -> Result<Vec<hook_server::ActiveSessionInfo>, String> {
+    let sessions = active_sessions.lock().await;
+    Ok(sessions.values().cloned().collect())
+}
+
+#[tauri::command]
 async fn focus_claude_terminal(
     session_id: Option<String>,
     active_sessions: tauri::State<'_, hook_server::ActiveSessions>,
@@ -628,6 +636,8 @@ pub fn run() {
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let session_store: Arc<tokio::sync::Mutex<SessionStore>> =
         Arc::new(tokio::sync::Mutex::new(SessionStore::load()));
+    let session_thread_map: slack_bridge::SessionThreadMap =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Load auto-review config
     let config_dir = config::get_config_dir();
@@ -676,6 +686,7 @@ pub fn run() {
             focus_claude_terminal,
             trigger_check_pr,
             kill_session,
+            get_active_sessions,
         ])
         .setup(move |app| {
             // Fix transparent window on Windows - clear both window and webview backgrounds
@@ -725,6 +736,7 @@ pub fn run() {
                 last_hook_activity.clone(),
                 active_sessions.clone(),
                 internal_pids.clone(),
+                session_thread_map.clone(),
             );
 
             // Scan for existing Claude sessions on startup
@@ -734,8 +746,8 @@ pub fn run() {
                 let scan_store = session_store.clone();
                 let scan_internal = internal_pids.clone();
                 tauri::async_runtime::spawn(async move {
-                    // Small delay to let frontend initialize
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Short delay for internal setup; frontend pulls via get_active_sessions after this
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     hook_server::scan_existing_sessions(&scan_handle, &scan_sessions, &scan_store, &scan_internal).await;
                 });
             }
@@ -848,6 +860,7 @@ pub fn run() {
             let menu_session_store = session_store.clone();
             let active_sessions_menu = active_sessions.clone();
             let menu_trigger = manual_poll_trigger.clone();
+            let session_thread_map = session_thread_map.clone();
             app.on_menu_event(move |app, event| {
                 let id = event.id().as_ref().to_string();
 
@@ -962,19 +975,13 @@ pub fn run() {
                     let slack_clone = menu_slack.clone();
                     let store_clone = menu_session_store.clone();
                     let green_clone = menu_green.clone();
+                    let active_clone = active_sessions_menu.clone();
+                    let thread_map_clone = session_thread_map.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Some(slack) = slack_clone {
-                            // Get last terminal session from the session store
-                            let initial_session = {
-                                let store = store_clone.lock().await;
-                                store.recent(1).first().map(|r| hook_server::TerminalSession {
-                                    session_id: r.session_id.clone(),
-                                    working_dir: r.working_dir.clone(),
-                                })
-                            };
                             slack_bridge::run_remote_session(
-                                slack, pending_clone, away_flag, slack_config, initial_session,
-                                store_clone, green_clone,
+                                slack, pending_clone, away_flag, slack_config,
+                                store_clone, green_clone, active_clone, thread_map_clone,
                             ).await;
                         }
                     });
@@ -988,6 +995,11 @@ pub fn run() {
                     }
                     menu_is_away.store(false, Ordering::SeqCst);
                     menu_auto.store(false, Ordering::SeqCst);
+                    // Clear session→thread mappings (they're only valid during away mode)
+                    let stm = session_thread_map.clone();
+                    tauri::async_runtime::spawn(async move {
+                        stm.lock().await.clear();
+                    });
                     let _ = app.emit("mode_changed", "home");
                     plog!("[Pawkit] 已切换到回家模式");
                     return;

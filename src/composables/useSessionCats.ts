@@ -1,5 +1,6 @@
 import { reactive, computed, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 
@@ -77,7 +78,7 @@ function getOrCreateSession(sessionId: string, title?: string): CatSession {
       sessionId,
       title: title || `Session ${sessionId.slice(0, 8)}`,
       workingDir: "",
-      baseState: "idle",
+      baseState: isAway.value ? "away" : "idle",
       tempState: null,
       hasUnread: false,
       reviewBubble: null,
@@ -149,9 +150,10 @@ export async function initSessionCats() {
     })
   );
 
-  // Claude stopped → base state = idle, clear success/knock temp if present
+  // Claude stopped → base state = idle (but stay "away" in away mode)
   unlisteners.push(
     await listen<{ session_id?: string }>("claude_stopped", (event) => {
+      if (isAway.value) return;
       const sid = event.payload?.session_id;
       if (sid && sessions.has(sid)) {
         const cat = sessions.get(sid)!;
@@ -196,7 +198,7 @@ export async function initSessionCats() {
     })
   );
 
-  // Mode changes → base state
+  // Mode changes → base state (applies to ALL cats, not just idle)
   unlisteners.push(
     await listen<string>("mode_changed", (event) => {
       const mode = event.payload;
@@ -205,9 +207,19 @@ export async function initSessionCats() {
         idleCatBaseState.value = "away";
         idleCatTempState.value = null;
         idleCatUnread.value = false;
+        // Set ALL session cats to away
+        for (const cat of sessions.values()) {
+          cat.baseState = "away";
+          cat.tempState = null;
+        }
       } else {
         idleCatBaseState.value = "idle";
         idleCatTempState.value = null;
+        // Restore all session cats to idle
+        for (const cat of sessions.values()) {
+          cat.baseState = "idle";
+          cat.tempState = null;
+        }
       }
     })
   );
@@ -225,6 +237,26 @@ export async function initSessionCats() {
       // Reserved for future stuck visual state
     })
   );
+
+  // Pull active sessions from backend — covers sessions discovered before listeners were ready
+  // Pull twice: immediately (in case scan already ran) and after 3s (in case scan is still running)
+  const pullActiveSessions = async () => {
+    try {
+      const existing = await invoke<Array<{ session_id: string; title: string; working_dir: string }>>(
+        "get_active_sessions"
+      );
+      for (const s of existing) {
+        if (!sessions.has(s.session_id)) {
+          const cat = getOrCreateSession(s.session_id, s.title);
+          cat.workingDir = s.working_dir;
+        }
+      }
+    } catch {
+      // Backend not ready yet
+    }
+  };
+  await pullActiveSessions();
+  setTimeout(pullActiveSessions, 3000);
 }
 
 export function cleanupSessionCats() {

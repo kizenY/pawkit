@@ -136,6 +136,14 @@ impl SessionStore {
         }
     }
 
+    /// Update the working directory for a session.
+    pub fn set_working_dir(&mut self, session_id: &str, working_dir: &str) {
+        if let Some(r) = self.records.iter_mut().find(|r| r.session_id == session_id) {
+            r.working_dir = working_dir.to_string();
+            self.save();
+        }
+    }
+
     /// Add cost to a session's running total.
     pub fn add_cost(&mut self, session_id: &str, cost: f64) {
         if let Some(r) = self.records.iter_mut().find(|r| r.session_id == session_id) {

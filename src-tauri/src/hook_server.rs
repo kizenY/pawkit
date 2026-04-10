@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::plog;
 use crate::claude_session::ClaudeSession;
 use crate::session_store::{self, SessionRecord, SessionSource, SessionStore};
-use crate::slack_bridge::SlackBridge;
+use crate::slack_bridge::{SessionThreadMap, SlackBridge};
 
 /// Per-session last hook activity timestamps for stuck detection
 pub type LastHookActivity = Arc<Mutex<HashMap<String, Instant>>>;
@@ -75,13 +75,6 @@ pub enum AuthDecision {
     Deny,
 }
 
-/// Last known terminal session info (session ID + working directory)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminalSession {
-    pub session_id: String,
-    pub working_dir: String,
-}
-
 /// Tools the user has chosen to auto-allow for this session ("Allow All")
 pub type SessionAllowTools = Arc<Mutex<Vec<String>>>;
 
@@ -102,6 +95,8 @@ struct AppState {
     /// PIDs of internal `claude -p` processes (LLM title gen) that should not spawn cats.
     /// Contains the shell PID; we check if a session's PID is a descendant.
     internal_pids: Arc<Mutex<HashSet<u32>>>,
+    /// Maps Claude session_id → Slack thread_ts for per-session notification routing
+    session_thread_map: SessionThreadMap,
 }
 
 /// Summarize tool input into a short readable string
@@ -306,8 +301,21 @@ async fn try_discover_session(state: &AppState, session_id: &str) {
 
     let working_dir = {
         let store = state.session_store.lock().await;
-        store.by_id(session_id).map(|r| r.working_dir.clone())
+        store.by_id(session_id)
+            .map(|r| r.working_dir.clone())
+            .filter(|w| !w.is_empty())
     }.unwrap_or_else(|| session_store::resolve_session_working_dir(session_id).unwrap_or_default());
+
+    // If session store had empty working_dir but we resolved it, update the store
+    if !working_dir.is_empty() {
+        let mut store = state.session_store.lock().await;
+        let needs_wd_update = store.by_id(session_id)
+            .map(|r| r.working_dir.is_empty())
+            .unwrap_or(false);
+        if needs_wd_update {
+            store.set_working_dir(session_id, &working_dir);
+        }
+    }
 
     let info = ActiveSessionInfo {
         session_id: session_id.to_string(),
@@ -316,7 +324,7 @@ async fn try_discover_session(state: &AppState, session_id: &str) {
         pid,
     };
     active.insert(session_id.to_string(), info.clone());
-    plog!("[Pawkit] Session discovered: {} title={} pid={:?}", session_id, title, pid);
+    plog!("[Pawkit] Session discovered: {} title={} wd={} pid={:?}", session_id, title, working_dir, pid);
     let _ = state.app_handle.emit("session_discovered", &info);
 
     if needs_llm_title {
@@ -346,7 +354,7 @@ async fn handle_notification(
         }
     }
 
-    // In away mode, forward notification content to Slack with session context
+    // In away mode, forward notification content to the session's Slack thread
     if state.is_away.load(Ordering::SeqCst) {
         if let Some(ref slack) = state.slack {
             let message = payload.get("message").and_then(|v| v.as_str())
@@ -364,7 +372,19 @@ async fn handle_notification(
                     } else {
                         String::new()
                     };
-                    let _ = slack.reply(&format!("🔔 {}{}", session_prefix, msg)).await;
+                    let notification = format!("🔔 {}{}", session_prefix, msg);
+
+                    // Route to the session's thread if mapped, otherwise use default
+                    let thread_ts = if let Some(sid) = session_id {
+                        state.session_thread_map.lock().await.get(sid).cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(ts) = thread_ts {
+                        let _ = slack.reply_in_thread(&ts, &notification).await;
+                    } else {
+                        let _ = slack.reply(&notification).await;
+                    }
                 }
             }
         }
@@ -429,13 +449,27 @@ async fn handle_pre_tool_use(
 
     let summary = summarize_tool_input(&tool_name, &input.tool_input);
 
+    // Resolve the Slack thread for this session (used by green light + away mode)
+    let session_thread_ts = if let Some(ref sid) = input.session_id {
+        state.session_thread_map.lock().await.get(sid).cloned()
+    } else {
+        None
+    };
+
     // === Green light mode: auto-approve everything, just notify ===
     if state.green_light.load(Ordering::SeqCst) {
         if state.is_away.load(Ordering::SeqCst) {
             if let Some(ref slack) = state.slack {
                 let s = slack.clone();
                 let msg = format!("🟢 *{}*\n`{}`", tool_name, summary);
-                tokio::spawn(async move { let _ = s.reply(&msg).await; });
+                let ts = session_thread_ts.clone();
+                tokio::spawn(async move {
+                    if let Some(ts) = ts {
+                        let _ = s.reply_in_thread(&ts, &msg).await;
+                    } else {
+                        let _ = s.reply(&msg).await;
+                    }
+                });
             }
         }
         let _ = state.app_handle.emit("green_light_approved", &serde_json::json!({
@@ -458,14 +492,17 @@ async fn handle_pre_tool_use(
         // Auto-approve mode: allow everything
         if state.auto_approve.load(Ordering::SeqCst) {
             if let Some(ref slack) = state.slack {
-                let _ = slack
-                    .reply(&format!("🔓 自动允许: *{}*\n`{}`", tool_name, summary))
-                    .await;
+                let msg = format!("🔓 自动允许: *{}*\n`{}`", tool_name, summary);
+                if let Some(ref ts) = session_thread_ts {
+                    let _ = slack.reply_in_thread(ts, &msg).await;
+                } else {
+                    let _ = slack.reply(&msg).await;
+                }
             }
             return make_allow_response();
         }
 
-        // Critical tool → post to Slack with buttons and wait for user decision
+        // Critical tool → post to Slack with buttons in the session's thread
         if let Some(ref slack) = state.slack {
             let request_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel::<AuthDecision>();
@@ -475,8 +512,12 @@ async fn handle_pre_tool_use(
                 pending.insert(request_id.clone(), tx);
             }
 
-            // Post auth request with Allow/Deny buttons
-            let _ = slack.post_auth_buttons(&tool_name, &summary, &request_id).await;
+            // Post auth request with Allow/Deny buttons in the session's thread
+            if let Some(ref ts) = session_thread_ts {
+                let _ = slack.post_auth_buttons_in_thread(ts, &tool_name, &summary, &request_id).await;
+            } else {
+                let _ = slack.post_auth_buttons(&tool_name, &summary, &request_id).await;
+            }
 
             // Wait for decision (5 min timeout for remote)
             let decision =
@@ -553,11 +594,22 @@ async fn handle_stop(
         let _ = state.app_handle.emit("claude_task_done", &sid_payload);
     }
 
-    // F1: Clear Slack "thinking" status in away mode
+    // F1: Clear Slack "thinking" status in away mode (per-session thread)
     if state.is_away.load(Ordering::SeqCst) {
         if let Some(ref slack) = state.slack {
             let s = slack.clone();
-            tokio::spawn(async move { let _ = s.clear_status().await; });
+            let thread_ts = if let Some(sid) = session_id {
+                state.session_thread_map.lock().await.get(sid).cloned()
+            } else {
+                None
+            };
+            tokio::spawn(async move {
+                if let Some(ts) = thread_ts {
+                    let _ = s.set_status_in_thread(&ts, "").await;
+                } else {
+                    let _ = s.clear_status().await;
+                }
+            });
         }
     }
     StatusCode::OK
@@ -581,11 +633,22 @@ async fn handle_user_prompt(
         }
     }
 
-    // F1: Set Slack "thinking" status in away mode
+    // F1: Set Slack "thinking" status in away mode (per-session thread)
     if state.is_away.load(Ordering::SeqCst) {
         if let Some(ref slack) = state.slack {
             let s = slack.clone();
-            tokio::spawn(async move { let _ = s.set_status("🤔 thinking...").await; });
+            let thread_ts = if let Some(sid) = session_id {
+                state.session_thread_map.lock().await.get(sid).cloned()
+            } else {
+                None
+            };
+            tokio::spawn(async move {
+                if let Some(ts) = thread_ts {
+                    let _ = s.set_status_in_thread(&ts, "🤔 thinking...").await;
+                } else {
+                    let _ = s.set_status("🤔 thinking...").await;
+                }
+            });
         }
     }
     StatusCode::OK
@@ -619,6 +682,7 @@ pub fn start_hook_server(
     last_hook_activity: LastHookActivity,
     active_sessions: ActiveSessions,
     internal_pids: Arc<Mutex<HashSet<u32>>>,
+    session_thread_map: SessionThreadMap,
 ) {
     let state = AppState {
         pending,
@@ -634,6 +698,7 @@ pub fn start_hook_server(
         last_hook_activity,
         active_sessions,
         internal_pids,
+        session_thread_map,
     };
 
     let app = Router::new()
@@ -695,7 +760,14 @@ fn resolve_session_pid(session_id: &str) -> Option<u32> {
 /// Upsert a terminal session into the session store (called from hook handlers).
 async fn upsert_terminal_session(store: &Arc<Mutex<SessionStore>>, session_id: &str) {
     let mut store = store.lock().await;
-    if store.by_id(session_id).is_some() {
+    if let Some(record) = store.by_id(session_id) {
+        // Backfill empty working_dir if we can resolve it now
+        if record.working_dir.is_empty() {
+            if let Some(wd) = session_store::resolve_session_working_dir(session_id) {
+                plog!("[Pawkit] Backfilling working_dir for {}: {}", session_id, wd);
+                store.set_working_dir(session_id, &wd);
+            }
+        }
         store.touch_and_save(session_id);
     } else {
         let title = session_store::generate_title(session_id);
@@ -792,8 +864,21 @@ pub async fn scan_existing_sessions(
 
         let working_dir = {
             let store = session_store.lock().await;
-            store.by_id(&session_id).map(|r| r.working_dir.clone())
+            store.by_id(&session_id)
+                .map(|r| r.working_dir.clone())
+                .filter(|w| !w.is_empty())
         }.unwrap_or_else(|| session_store::resolve_session_working_dir(&session_id).unwrap_or_default());
+
+        // If session store had empty working_dir but we resolved it, update the store
+        if !working_dir.is_empty() {
+            let mut store = session_store.lock().await;
+            let needs_wd_update = store.by_id(&session_id)
+                .map(|r| r.working_dir.is_empty())
+                .unwrap_or(false);
+            if needs_wd_update {
+                store.set_working_dir(&session_id, &working_dir);
+            }
+        }
 
         let info = ActiveSessionInfo {
             session_id: session_id.clone(),
@@ -802,7 +887,7 @@ pub async fn scan_existing_sessions(
             pid,
         };
         active.insert(session_id.clone(), info.clone());
-        plog!("[Pawkit] Startup scan: found session {} title={} pid={:?}", session_id, title, pid);
+        plog!("[Pawkit] Startup scan: found session {} title={} wd={} pid={:?}", session_id, title, working_dir, pid);
         let _ = app_handle.emit("session_discovered", &info);
 
         // Spawn LLM title refinement in background

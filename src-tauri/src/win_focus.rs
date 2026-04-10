@@ -357,11 +357,56 @@ fn find_tab_index(hwnd: isize, claude_pid: u32) -> Option<usize> {
             }
         }
 
+        // Filter shells: when multiple WT windows share one process, only count shells
+        // belonging to our target window. Use CACHED_HWNDS to identify which shells
+        // are associated with which window.
+        let filtered: Vec<(u32, u64)> = if let Ok(guard) = CACHED_HWNDS.lock() {
+            if let Some(ref cache) = *guard {
+                // Build shell → hwnd mapping from cached session PIDs
+                let mut shell_hwnd: std::collections::HashMap<u32, isize> = std::collections::HashMap::new();
+                for (&cached_pid, &cached_hwnd) in cache.iter() {
+                    let mut cur = cached_pid;
+                    for _ in 0..20 {
+                        if children_with_time.iter().any(|&(pid, _)| pid == cur) {
+                            shell_hwnd.insert(cur, cached_hwnd);
+                            break;
+                        }
+                        if let Some(&parent) = parent_map.get(&cur) {
+                            if parent == 0 || parent == cur { break; }
+                            cur = parent;
+                        } else { break; }
+                    }
+                }
+
+                let excluded = shell_hwnd.iter().any(|(&_, &h)| h != hwnd);
+                if excluded {
+                    // Some shells are in other windows — filter them out
+                    let result: Vec<_> = children_with_time.iter().copied()
+                        .filter(|&(pid, _)| {
+                            match shell_hwnd.get(&pid) {
+                                Some(&h) => h == hwnd,
+                                None => true, // unknown → assume same window
+                            }
+                        })
+                        .collect();
+                    plog!("[Pawkit] find_tab_index: filtered {} → {} shells for hwnd={}",
+                        children_with_time.len(), result.len(), hwnd);
+                    result
+                } else {
+                    children_with_time.clone()
+                }
+            } else {
+                children_with_time.clone()
+            }
+        } else {
+            children_with_time.clone()
+        };
+
         let result = target_child.and_then(|target| {
-            children_with_time.iter().position(|&(pid, _)| pid == target)
+            filtered.iter().position(|&(pid, _)| pid == target)
         });
         plog!("[Pawkit] find_tab_index: sorted_children={:?} target_child={:?} result={:?}",
-            children_with_time.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
+            filtered.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
             target_child, result);
         result
     }
@@ -549,20 +594,53 @@ fn find_window_by_pid_set(pids: &[u32]) -> Option<isize> {
         EnumWindows(callback, &mut data as *mut CallbackData as isize);
     }
 
-    // Pick the window with the largest area (main window is largest)
-    let best = data.candidates.iter().copied().max_by_key(|&hwnd| {
-        let mut rect = [0i32; 4]; // left, top, right, bottom
-        if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
-            let w = (rect[2] - rect[0]).abs() as i64;
-            let h = (rect[3] - rect[1]).abs() as i64;
-            w * h
+    // Smart window selection when multiple candidates (e.g. two WT windows sharing one process).
+    // Priority: 1) already cached for another session, 2) title contains "claude", 3) largest area.
+    let best = if data.candidates.len() <= 1 {
+        data.candidates.first().copied()
+    } else {
+        // 1) Prefer a window already cached for another session (cross-session learning).
+        //    If session A correctly found the Claude WT window, session B should use the same one.
+        let from_cache = if let Ok(guard) = CACHED_HWNDS.lock() {
+            if let Some(ref map) = *guard {
+                let cached_set: std::collections::HashSet<isize> = map.values().copied().collect();
+                data.candidates.iter().copied().find(|h| cached_set.contains(h))
+            } else { None }
+        } else { None };
+
+        if let Some(hwnd) = from_cache {
+            plog!("[Pawkit] find_window_by_pid_set: reusing cached hwnd={} (cross-session)", hwnd);
+            Some(hwnd)
         } else {
-            0
+            // 2) Prefer a window whose title contains "claude"
+            let from_title = data.candidates.iter().copied().find(|&hwnd| {
+                let title = get_window_title(hwnd).to_lowercase();
+                title.contains("claude")
+            });
+
+            if let Some(hwnd) = from_title {
+                plog!("[Pawkit] find_window_by_pid_set: picked hwnd={} (title match)", hwnd);
+                Some(hwnd)
+            } else {
+                // 3) Fall back to largest area
+                let largest = data.candidates.iter().copied().max_by_key(|&hwnd| {
+                    let mut rect = [0i32; 4];
+                    if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
+                        let w = (rect[2] - rect[0]).abs() as i64;
+                        let h = (rect[3] - rect[1]).abs() as i64;
+                        w * h
+                    } else {
+                        0
+                    }
+                });
+                plog!("[Pawkit] find_window_by_pid_set: picked hwnd={:?} (largest area)", largest);
+                largest
+            }
         }
-    });
+    };
 
     if let Some(hwnd) = best {
-        plog!("[Pawkit] find_window_by_pid_set: picked hwnd={} from {} candidates", hwnd, data.candidates.len());
+        plog!("[Pawkit] find_window_by_pid_set: final hwnd={} from {} candidates", hwnd, data.candidates.len());
         if let Ok(mut guard) = CACHED_HWNDS.lock() {
             let map = guard.get_or_insert_with(std::collections::HashMap::new);
             map.insert(cache_key, hwnd);
