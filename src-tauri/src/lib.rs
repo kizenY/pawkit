@@ -229,8 +229,11 @@ async fn kill_session(
             plog!("[Pawkit] Killing session {} (pid={})", session_id, pid);
             #[cfg(target_os = "windows")]
             {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
                 let _ = std::process::Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .creation_flags(CREATE_NO_WINDOW)
                     .spawn();
             }
             #[cfg(not(target_os = "windows"))]
@@ -545,9 +548,11 @@ fn rebuild_tray_menu(app_handle: &tauri::AppHandle, shared_config: &SharedConfig
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        // Use tasklist to check if process exists
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
@@ -760,6 +765,7 @@ pub fn run() {
                 slack_bridge.clone(),
                 is_away.clone(),
                 manual_poll_trigger.clone(),
+                session_thread_map.clone(),
             );
 
             // Poll foreground window to detect when user switches to Claude terminal
@@ -921,8 +927,11 @@ pub fn run() {
                                 plog!("[Pawkit] Killing session {} (pid={}) from menu", session_id, pid);
                                 #[cfg(target_os = "windows")]
                                 {
+                                    use std::os::windows::process::CommandExt;
+                                    const CREATE_NO_WINDOW: u32 = 0x08000000;
                                     let _ = std::process::Command::new("taskkill")
                                         .args(["/PID", &pid.to_string(), "/T", "/F"])
+                                        .creation_flags(CREATE_NO_WINDOW)
                                         .spawn();
                                 }
                                 #[cfg(not(target_os = "windows"))]
