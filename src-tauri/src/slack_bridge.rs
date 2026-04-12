@@ -1,13 +1,19 @@
+#[allow(unused_imports)]
 use crate::plog;
 use crate::claude_session::{ClaudeOutput, ClaudeSession};
 use crate::config::SlackConfig;
-use crate::hook_server::{AuthDecision, PendingRequests, TerminalSession};
+use crate::hook_server::{ActiveSessions, AuthDecision, PendingRequests};
+use crate::session_store::{SessionRecord, SessionSource, SessionStore};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// Maps Claude session_id → Slack thread_ts for routing hook notifications to the correct thread.
+pub type SessionThreadMap = Arc<Mutex<HashMap<String, String>>>;
 
 /// Slack API client for DM communication via Socket Mode
 #[derive(Clone)]
@@ -189,8 +195,96 @@ impl SlackBridge {
         *self.active_thread_ts.lock().await = ts.to_string();
     }
 
+    #[allow(dead_code)]
     pub async fn get_active_thread(&self) -> String {
         self.active_thread_ts.lock().await.clone()
+    }
+
+    /// Reply in a specific thread (bypasses active_thread_ts)
+    pub async fn reply_in_thread(&self, thread_ts: &str, text: &str) -> Result<String, String> {
+        let channel = self.dm_channel_id.lock().await.clone();
+        if thread_ts.is_empty() {
+            return self.post_top_message(text).await;
+        }
+        let data = self
+            .api_post(
+                "chat.postMessage",
+                &serde_json::json!({
+                    "channel": channel,
+                    "text": text,
+                    "thread_ts": thread_ts,
+                }),
+            )
+            .await?;
+        Ok(data["ts"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Post auth buttons in a specific thread (bypasses active_thread_ts)
+    pub async fn post_auth_buttons_in_thread(
+        &self,
+        thread_ts: &str,
+        tool_name: &str,
+        summary: &str,
+        request_id: &str,
+    ) -> Result<String, String> {
+        let channel = self.dm_channel_id.lock().await.clone();
+        let text = format!("🔒 权限请求: {} — {}", tool_name, summary);
+        let blocks = serde_json::json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!("🔒 *权限请求: {}*\n```{}```", tool_name, summary)
+                }
+            },
+            {
+                "type": "actions",
+                "block_id": format!("auth_{}", request_id),
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "✅ Allow" },
+                        "action_id": "auth_allow",
+                        "style": "primary",
+                        "value": request_id
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "❌ Deny" },
+                        "action_id": "auth_deny",
+                        "style": "danger",
+                        "value": request_id
+                    }
+                ]
+            }
+        ]);
+        let body = serde_json::json!({
+            "channel": channel,
+            "text": text,
+            "blocks": blocks,
+            "thread_ts": thread_ts,
+        });
+        let data = self.api_post("chat.postMessage", &body).await?;
+        Ok(data["ts"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Set typing status in a specific thread
+    pub async fn set_status_in_thread(&self, thread_ts: &str, status: &str) -> Result<(), String> {
+        let channel = self.dm_channel_id.lock().await.clone();
+        if thread_ts.is_empty() {
+            return Ok(());
+        }
+        let _ = self
+            .api_post(
+                "assistant.threads.setStatus",
+                &serde_json::json!({
+                    "channel_id": channel,
+                    "thread_ts": thread_ts,
+                    "status": status,
+                }),
+            )
+            .await;
+        Ok(())
     }
 
     async fn api_post(&self, method: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -207,31 +301,31 @@ impl SlackBridge {
 
 // ── Helpers ──
 
-async fn post_claude_output(slack: &SlackBridge, output: &ClaudeOutput) {
+async fn post_claude_output_in_thread(slack: &SlackBridge, thread_ts: &str, output: &ClaudeOutput) {
     let text = &output.text;
     if text.is_empty() {
-        let _ = slack.reply("_(无输出)_").await;
+        let _ = slack.reply_in_thread(thread_ts, "_(无输出)_").await;
         return;
     }
 
     let max_len = 3000;
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_len {
-        let _ = slack.reply(text).await;
+        let _ = slack.reply_in_thread(thread_ts, text).await;
     } else {
         let total = (chars.len() + max_len - 1) / max_len;
         for (i, chunk) in chars.chunks(max_len).enumerate() {
             let chunk_text: String = chunk.iter().collect();
-            let _ = slack.reply(&format!("_({}/{})_\n{}", i + 1, total, chunk_text)).await;
+            let _ = slack.reply_in_thread(thread_ts, &format!("_({}/{})_\n{}", i + 1, total, chunk_text)).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
 
     if let Some(cost) = output.cost_usd {
         if let Some(dur) = output.duration_ms {
-            let _ = slack.reply(&format!("💰 ${:.4} ⏱ {:.1}s", cost, dur as f64 / 1000.0)).await;
+            let _ = slack.reply_in_thread(thread_ts, &format!("💰 ${:.4} ⏱ {:.1}s", cost, dur as f64 / 1000.0)).await;
         } else {
-            let _ = slack.reply(&format!("💰 ${:.4}", cost)).await;
+            let _ = slack.reply_in_thread(thread_ts, &format!("💰 ${:.4}", cost)).await;
         }
     }
 }
@@ -257,6 +351,8 @@ struct UserMessage {
     text: String,
     /// None = top-level message (new thread), Some = reply in existing thread
     thread_ts: Option<String>,
+    /// The message's own ts (used as thread parent for top-level messages)
+    msg_ts: String,
 }
 
 /// Extract user message + thread info from a Socket Mode event.
@@ -288,8 +384,9 @@ fn extract_user_message(envelope: &serde_json::Value, dm_user_id: &str, dm_chann
     if text.is_empty() { return None; }
 
     let thread_ts = event.get("thread_ts").and_then(|v| v.as_str()).map(String::from);
+    let msg_ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    Some(UserMessage { text, thread_ts })
+    Some(UserMessage { text, thread_ts, msg_ts })
 }
 
 /// Extract plain text from Slack's rich_text blocks.
@@ -415,10 +512,30 @@ fn extract_button_action(envelope: &serde_json::Value) -> Option<ButtonAction> {
 
 // ── Main session loop ──
 
-/// Prompt with metadata: whether to start a new session
+/// Prompt with thread context for multi-session routing
 struct Prompt {
     text: String,
+    /// Which Slack thread to reply in
+    thread_ts: String,
+    /// Whether this starts a new session (top-level message)
     new_session: bool,
+}
+
+/// Per-thread session context
+struct ThreadSession {
+    session: ClaudeSession,
+    /// Claude Code's session_id (known after first run_prompt)
+    claude_session_id: Option<String>,
+    /// Per-thread /btw queue
+    btw_queue: Vec<String>,
+}
+
+/// Known Pawkit commands that should NOT be forwarded to Claude Code
+const PAWKIT_COMMANDS: &[&str] = &["!ping", "!auto", "!green", "!cd", "!stop", "!status"];
+
+fn is_pawkit_command(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    PAWKIT_COMMANDS.iter().any(|cmd| lower.starts_with(cmd))
 }
 
 pub async fn run_remote_session(
@@ -426,7 +543,10 @@ pub async fn run_remote_session(
     pending: PendingRequests,
     is_away: Arc<AtomicBool>,
     config: SlackConfig,
-    initial_session: Option<TerminalSession>,
+    session_store: Arc<Mutex<SessionStore>>,
+    green_light: Arc<AtomicBool>,
+    active_sessions: ActiveSessions,
+    session_thread_map: SessionThreadMap,
 ) {
     if let Err(e) = slack.init().await {
         plog!("[Pawkit] Slack init failed: {}", e);
@@ -434,15 +554,14 @@ pub async fn run_remote_session(
         return;
     }
 
-    // Post welcome as top-level message — this starts the first thread
-    // Use --continue to inherit the last local session
+    // Post welcome as top-level message (instructions only, not tied to any session)
     let _welcome_ts = match slack.post_top_message(&format!(
         "🐱 *Pawkit 远程模式已启动*\n\
-         📂 工作目录: `{}`\n\
-         _在此 thread 中继续最近的会话_\n\
-         _(先退出终端 Claude Code 再外出，确保会话能被继承)_\n\n\
-         新消息(非thread回复) = 新建会话\n\
-         `!ping` `!cd` `!stop` `!auto on/off`",
+         📂 默认工作目录: `{}`\n\n\
+         新消息 = 新建会话 thread\n\
+         thread 回复 = 继续该会话\n\n\
+         `!ping` `!auto on/off` `!green on/off` `!stop` `!status`\n\
+         `/btw <msg>` 追加消息 | `!命令` → Claude Code `/命令`",
         config.working_dir
     )).await {
         Ok(ts) => ts,
@@ -453,18 +572,29 @@ pub async fn run_remote_session(
         }
     };
 
-    // If we have a specific terminal session (ID + working dir from hook server),
-    // resume that exact session with its original working directory.
-    // --continue is unreliable because it scopes to working_dir and would only
-    // find previous Slack sessions (since Slack uses a different working_dir).
-    let session = if let Some(ref ts) = initial_session {
-        let wd = if ts.working_dir.is_empty() { config.working_dir.clone() } else { ts.working_dir.clone() };
-        plog!("[Pawkit] Resuming terminal session: {} (cwd={})", ts.session_id, wd);
-        Arc::new(Mutex::new(ClaudeSession::new_resume(ts.session_id.clone(), wd)))
-    } else {
-        plog!("[Pawkit] No terminal session captured, starting fresh");
-        Arc::new(Mutex::new(ClaudeSession::new(config.working_dir.clone())))
-    };
+    // Create Slack threads for each existing active session
+    {
+        let sessions = active_sessions.lock().await;
+        for (sid, info) in sessions.iter() {
+            let dir_name = std::path::Path::new(&info.working_dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| info.working_dir.clone());
+            let thread_msg = format!(
+                "🐱 *{}* — `{}`\n_session: `{}`_\n_在此 thread 回复即可继续该会话对话_",
+                info.title, dir_name, &sid[..sid.len().min(8)]
+            );
+            match slack.post_top_message(&thread_msg).await {
+                Ok(ts) => {
+                    plog!("[Pawkit] Created Slack thread for session {}: ts={}", sid, ts);
+                    session_thread_map.lock().await.insert(sid.clone(), ts);
+                }
+                Err(e) => {
+                    plog!("[Pawkit] Failed to create thread for session {}: {}", sid, e);
+                }
+            }
+        }
+    }
 
     let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<Prompt>(32);
     let auto_approve = Arc::new(AtomicBool::new(false));
@@ -474,6 +604,9 @@ pub async fn run_remote_session(
     let ws_pending = pending.clone();
     let ws_away = is_away.clone();
     let ws_auto = auto_approve.clone();
+    let ws_green = green_light.clone();
+    let ws_thread_map = session_thread_map.clone();
+    let ws_active = active_sessions.clone();
 
     let listener = tokio::spawn(async move {
         while ws_away.load(Ordering::SeqCst) {
@@ -545,7 +678,6 @@ pub async fn run_remote_session(
                         let allow = action.action_id == "auth_allow";
                         if resolve_first_pending(&ws_pending, allow).await {
                             let (emoji, label) = if allow { ("✅", "已允许") } else { ("❌", "已拒绝") };
-                            // Replace the buttons with a resolved status line
                             let updated_blocks = serde_json::json!([
                                 {
                                     "type": "section",
@@ -582,24 +714,69 @@ pub async fn run_remote_session(
                 };
 
                 let preview: String = user_msg.text.chars().take(60).collect();
-                plog!("[Pawkit] Message: thread={:?} text={}", user_msg.thread_ts, preview);
+                plog!("[Pawkit] Message: thread={:?} msg_ts={} text={}", user_msg.thread_ts, user_msg.msg_ts, preview);
 
                 let lower = user_msg.text.to_lowercase();
-                let active_thread = ws_slack.get_active_thread().await;
 
-                // Inline commands — reply in whatever context
+                // Determine the reply thread: if in a thread use that, otherwise use msg_ts as new thread
+                let reply_thread = user_msg.thread_ts.as_deref().unwrap_or(&user_msg.msg_ts);
+
+                // Inline commands — reply in the message's thread context
                 if lower == "!ping" {
-                    let _ = ws_slack.reply("🏓 pong!").await;
+                    let _ = ws_slack.reply_in_thread(reply_thread, "🏓 pong!").await;
                     continue;
                 }
                 if lower == "!auto on" {
                     ws_auto.store(true, Ordering::SeqCst);
-                    let _ = ws_slack.reply("✅ 自动审批已开启").await;
+                    let _ = ws_slack.reply_in_thread(reply_thread, "✅ 自动审批已开启").await;
                     continue;
                 }
                 if lower == "!auto off" {
                     ws_auto.store(false, Ordering::SeqCst);
-                    let _ = ws_slack.reply("🔒 自动审批已关闭").await;
+                    let _ = ws_slack.reply_in_thread(reply_thread, "🔒 自动审批已关闭").await;
+                    continue;
+                }
+                if lower == "!green on" {
+                    ws_green.store(true, Ordering::SeqCst);
+                    let _ = ws_slack.reply_in_thread(reply_thread, "🟢 绿灯模式已开启").await;
+                    continue;
+                }
+                if lower == "!green off" {
+                    ws_green.store(false, Ordering::SeqCst);
+                    let _ = ws_slack.reply_in_thread(reply_thread, "🔴 绿灯模式已关闭").await;
+                    continue;
+                }
+                // !status — list active sessions and their threads
+                if lower == "!status" {
+                    let map = ws_thread_map.lock().await;
+                    if map.is_empty() {
+                        let _ = ws_slack.reply_in_thread(reply_thread, "📋 当前无活跃会话 thread").await;
+                    } else {
+                        // Collect session info including titles from active_sessions
+                        let active = ws_active.lock().await;
+                        let lines: Vec<String> = map.iter()
+                            .map(|(sid, _ts)| {
+                                let title = active.get(sid)
+                                    .map(|i| i.title.as_str())
+                                    .unwrap_or("?");
+                                format!("• *{}* `{}`", title, &sid[..sid.len().min(8)])
+                            })
+                            .collect();
+                        let _ = ws_slack.reply_in_thread(reply_thread, &format!("📋 活跃会话:\n{}", lines.join("\n"))).await;
+                    }
+                    continue;
+                }
+                // /btw command: queue message for the session in this thread
+                if lower.starts_with("/btw ") {
+                    let btw_text = user_msg.text[5..].trim().to_string();
+                    if !btw_text.is_empty() {
+                        // Send as prompt with a /btw prefix marker for the processor to handle
+                        let _ = prompt_tx.send(Prompt {
+                            text: format!("/btw {}", btw_text),
+                            thread_ts: reply_thread.to_string(),
+                            new_session: false,
+                        }).await;
+                    }
                     continue;
                 }
                 if (lower == "allow" || lower == "y" || lower == "deny" || lower == "n")
@@ -608,37 +785,26 @@ pub async fn run_remote_session(
                     let allow = lower == "allow" || lower == "y";
                     if resolve_first_pending(&ws_pending, allow).await {
                         let (e, a) = if allow { ("✅", "已允许") } else { ("❌", "已拒绝") };
-                        let _ = ws_slack.reply(&format!("{} {}", e, a)).await;
+                        let _ = ws_slack.reply_in_thread(reply_thread, &format!("{} {}", e, a)).await;
                         continue;
                     }
                 }
 
-                // Determine if this is a new session or continuing
-                let is_in_active_thread = user_msg.thread_ts.as_deref() == Some(&active_thread);
-                let is_new_session = !is_in_active_thread;
+                // Determine if this is a new session or reply to existing thread
+                let is_new_session = user_msg.thread_ts.is_none();
+                let thread_ts = if is_new_session {
+                    // Top-level message → its own ts becomes the thread parent
+                    user_msg.msg_ts.clone()
+                } else {
+                    // Thread reply → use the thread_ts
+                    user_msg.thread_ts.clone().unwrap_or(user_msg.msg_ts.clone())
+                };
 
-                if is_new_session {
-                    // User sent a top-level message or replied in a different thread
-                    // → new session, new thread parent
-                    // The message itself becomes the thread parent (its ts)
-                    // We need to get the ts from the event
-                    let event = envelope.get("payload")
-                        .and_then(|p| p.get("event"));
-                    let msg_ts = event
-                        .and_then(|e| e.get("ts"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-
-                    // If it's a top-level message, use its ts as the new thread
-                    // If it's in another thread, use that thread_ts
-                    let new_thread = user_msg.thread_ts.as_deref().unwrap_or(msg_ts);
-                    ws_slack.set_active_thread(new_thread).await;
-
-                    plog!("[Pawkit] New session, thread={}", new_thread);
-                }
+                plog!("[Pawkit] Routing to thread={} new_session={}", thread_ts, is_new_session);
 
                 let _ = prompt_tx.send(Prompt {
                     text: user_msg.text,
+                    thread_ts,
                     new_session: is_new_session,
                 }).await;
             }
@@ -650,66 +816,216 @@ pub async fn run_remote_session(
         }
     });
 
-    // --- Task 2: Prompt processor ---
+    // --- Task 2: Multi-session prompt processor ---
     let proc_slack = slack.clone();
-    let proc_session = session.clone();
     let proc_away = is_away.clone();
+    let proc_store = session_store.clone();
+    let proc_thread_map = session_thread_map.clone();
+    let proc_active = active_sessions.clone();
+    let default_wd = config.working_dir.clone();
 
     let processor = tokio::spawn(async move {
+        // Per-thread session contexts: thread_ts → ThreadSession
+        // NOT pre-populated — terminal session threads are notification-only until
+        // the user sends a message, at which point a fresh session starts in that
+        // session's working directory.
+        let mut thread_sessions: HashMap<String, ThreadSession> = HashMap::new();
+
         while let Some(prompt) = prompt_rx.recv().await {
             if !proc_away.load(Ordering::SeqCst) { break; }
 
-            // Handle special commands
+            let thread_ts = prompt.thread_ts.clone();
+
+            // Handle /btw — queue for later delivery
+            if prompt.text.starts_with("/btw ") {
+                let btw_text = prompt.text[5..].trim().to_string();
+                if let Some(ctx) = thread_sessions.get_mut(&thread_ts) {
+                    ctx.btw_queue.push(btw_text);
+                    let _ = proc_slack.reply_in_thread(&thread_ts, "📝 已记录，会在当前任务完成后转达").await;
+                } else {
+                    let _ = proc_slack.reply_in_thread(&thread_ts, "❓ 该 thread 没有活跃会话").await;
+                }
+                continue;
+            }
+
+            // Handle special commands — these operate on the thread's session
             if prompt.text.starts_with("!cd ") {
                 let dir = prompt.text[4..].trim().to_string();
-                if dir.is_empty() {
-                    let wd = proc_session.lock().await.working_dir().to_string();
-                    let _ = proc_slack.reply(&format!("📂 当前工作目录: `{}`", wd)).await;
-                } else if std::path::Path::new(&dir).is_dir() {
-                    proc_session.lock().await.set_working_dir(dir.clone());
-                    let _ = proc_slack.reply(&format!("📂 已切换到: `{}`", dir)).await;
+                if let Some(ctx) = thread_sessions.get_mut(&thread_ts) {
+                    if dir.is_empty() {
+                        let wd = ctx.session.working_dir().to_string();
+                        let _ = proc_slack.reply_in_thread(&thread_ts, &format!("📂 当前工作目录: `{}`", wd)).await;
+                    } else if std::path::Path::new(&dir).is_dir() {
+                        ctx.session.set_working_dir(dir.clone());
+                        let _ = proc_slack.reply_in_thread(&thread_ts, &format!("📂 已切换到: `{}`", dir)).await;
+                    } else {
+                        let _ = proc_slack.reply_in_thread(&thread_ts, &format!("❌ 目录不存在: `{}`", dir)).await;
+                    }
                 } else {
-                    let _ = proc_slack.reply(&format!("❌ 目录不存在: `{}`", dir)).await;
+                    let _ = proc_slack.reply_in_thread(&thread_ts, "❓ 该 thread 没有活跃会话").await;
                 }
                 continue;
             }
             if prompt.text == "!stop" {
-                let wd = proc_session.lock().await.working_dir().to_string();
-                proc_session.lock().await.reset();
-                let _ = proc_slack.reply(&format!("⏹ 会话已重置。工作目录: `{}`", wd)).await;
+                if let Some(ctx) = thread_sessions.get_mut(&thread_ts) {
+                    let wd = ctx.session.working_dir().to_string();
+                    ctx.session.reset();
+                    ctx.claude_session_id = None;
+                    let _ = proc_slack.reply_in_thread(&thread_ts, &format!("⏹ 会话已重置。工作目录: `{}`", wd)).await;
+                } else {
+                    let _ = proc_slack.reply_in_thread(&thread_ts, "❓ 该 thread 没有活跃会话").await;
+                }
                 continue;
             }
-            if prompt.text.starts_with('!') {
-                let _ = proc_slack.reply(&format!("❓ 未知命令: `{}`", prompt.text)).await;
-                continue;
+
+            // Convert !command → /command for Claude Code passthrough
+            // (e.g., !compact → /compact, !clear → /clear)
+            let prompt_text = if prompt.text.starts_with('!') && !is_pawkit_command(&prompt.text) {
+                let cc_cmd = format!("/{}", &prompt.text[1..]);
+                let _ = proc_slack.reply_in_thread(&thread_ts, &format!("🔧 → `{}`", cc_cmd)).await;
+                cc_cmd
+            } else {
+                prompt.text.clone()
+            };
+
+            // Get or create session for this thread
+            if prompt.new_session || !thread_sessions.contains_key(&thread_ts) {
+                // Check if this thread maps to an existing session (terminal or previous Slack)
+                let (existing_sid, wd) = {
+                    let map = proc_thread_map.lock().await;
+                    // Reverse lookup: find session_id for this thread_ts
+                    let sid = map.iter()
+                        .find(|(_k, v)| v.as_str() == thread_ts)
+                        .map(|(k, _)| k.clone());
+                    let wd = if let Some(ref sid) = sid {
+                        let sessions = proc_active.lock().await;
+                        sessions.get(sid)
+                            .map(|i| i.working_dir.clone())
+                            .filter(|w| !w.is_empty())
+                            .unwrap_or_else(|| default_wd.clone())
+                    } else {
+                        default_wd.clone()
+                    };
+                    // Only resume for thread replies (not new top-level messages)
+                    let resume_sid = if !prompt.new_session { sid } else { None };
+                    (resume_sid, wd)
+                };
+
+                let ctx = if let Some(ref sid) = existing_sid {
+                    // This thread belongs to an existing session → resume it
+                    plog!("[Pawkit] Resuming session {} in thread {} wd={}", sid, thread_ts, wd);
+                    let _ = proc_slack.reply_in_thread(&thread_ts, &format!("🔄 _继续会话 `{}`_", &sid[..sid.len().min(8)])).await;
+                    ThreadSession {
+                        session: ClaudeSession::new_resume(sid.clone(), wd),
+                        claude_session_id: Some(sid.clone()),
+                        btw_queue: Vec::new(),
+                    }
+                } else {
+                    // Brand new session
+                    if prompt.new_session {
+                        let _ = proc_slack.reply_in_thread(&thread_ts, "🆕 _新会话_").await;
+                    }
+                    ThreadSession {
+                        session: ClaudeSession::new(wd),
+                        claude_session_id: None,
+                        btw_queue: Vec::new(),
+                    }
+                };
+                thread_sessions.insert(thread_ts.clone(), ctx);
             }
 
-            // New session → reset Claude session to start fresh
-            if prompt.new_session {
-                let wd = proc_session.lock().await.working_dir().to_string();
-                *proc_session.lock().await = ClaudeSession::new(wd);
-                let _ = proc_slack.reply("🆕 _新会话_").await;
+            let ctx = thread_sessions.get_mut(&thread_ts).unwrap();
+
+            // Set active_thread_ts so hook_server auth buttons go to the right thread
+            proc_slack.set_active_thread(&thread_ts).await;
+
+            // Show typing indicator
+            let _ = proc_slack.set_status_in_thread(&thread_ts, "🤔 思考中...").await;
+
+            let mut result = ctx.session.run_prompt(&prompt_text).await;
+
+            // If --resume failed (stale/invalid session), fall back to fresh session and retry
+            if let Err(ref e) = result {
+                if e.contains("No conversation found") || e.contains("no session") {
+                    plog!("[Pawkit] Resume failed, starting fresh: {}", e);
+                    let _ = proc_slack.reply_in_thread(&thread_ts, "⚠️ 会话无法恢复，已新建会话").await;
+                    let wd = ctx.session.working_dir().to_string();
+                    ctx.session = ClaudeSession::new(wd);
+                    ctx.claude_session_id = None;
+                    result = ctx.session.run_prompt(&prompt_text).await;
+                }
             }
-
-            // Show typing indicator via Slack Assistants API (best-effort)
-            let _ = proc_slack.set_status("🤔 思考中...").await;
-
-            let mut session = proc_session.lock().await;
-            let result = session.run_prompt(&prompt.text).await;
 
             // Clear typing indicator
-            let _ = proc_slack.clear_status().await;
+            let _ = proc_slack.set_status_in_thread(&thread_ts, "").await;
 
             match result {
                 Ok(output) => {
+                    // Track session in store + update thread mapping
+                    if let Some(ref sid) = output.session_id {
+                        // Update session_thread_map so hooks route to this thread
+                        proc_thread_map.lock().await.insert(sid.clone(), thread_ts.clone());
+                        ctx.claude_session_id = Some(sid.clone());
+
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let mut store = proc_store.lock().await;
+                        if store.by_id(sid).is_none() {
+                            let title = crate::session_store::generate_title(sid);
+                            let wd = ctx.session.working_dir().to_string();
+                            store.upsert(SessionRecord {
+                                session_id: sid.clone(),
+                                title,
+                                working_dir: wd,
+                                created_at: now,
+                                last_active: now,
+                                source: SessionSource::Slack,
+                                slack_thread_ts: Some(thread_ts.clone()),
+                                total_cost_usd: output.cost_usd.unwrap_or(0.0),
+                            });
+                            let _ = proc_slack.reply_in_thread(&thread_ts, &format!("_sid: `{}`_", &sid[..sid.len().min(8)])).await;
+                        } else {
+                            store.touch(sid);
+                            if let Some(cost) = output.cost_usd {
+                                store.add_cost(sid, cost);
+                            }
+                            store.save();
+                        }
+                    }
+
                     if output.is_error {
-                        let _ = proc_slack.reply(&format!("⚠️ Claude 返回错误:\n```\n{}\n```", output.text)).await;
+                        let _ = proc_slack.reply_in_thread(&thread_ts, &format!("⚠️ Claude 返回错误:\n```\n{}\n```", output.text)).await;
                     } else {
-                        post_claude_output(&proc_slack, &output).await;
+                        post_claude_output_in_thread(&proc_slack, &thread_ts, &output).await;
                     }
                 }
                 Err(e) => {
-                    let _ = proc_slack.reply(&format!("❌ 执行失败:\n```\n{}\n```", e)).await;
+                    let _ = proc_slack.reply_in_thread(&thread_ts, &format!("❌ 执行失败:\n```\n{}\n```", e)).await;
+                }
+            }
+
+            // Process queued /btw messages after each prompt completes
+            let ctx = thread_sessions.get_mut(&thread_ts).unwrap();
+            let btw_messages: Vec<String> = ctx.btw_queue.drain(..).collect();
+            if !btw_messages.is_empty() {
+                let follow_up = format!(
+                    "BTW, the user wanted to add this context:\n{}",
+                    btw_messages.join("\n---\n")
+                );
+                let _ = proc_slack.reply_in_thread(&thread_ts, &format!("📝 转达中: _{}_", btw_messages.join("; "))).await;
+                let _ = proc_slack.set_status_in_thread(&thread_ts, "🤔 thinking about btw...").await;
+                match ctx.session.run_prompt(&follow_up).await {
+                    Ok(output) => {
+                        let _ = proc_slack.set_status_in_thread(&thread_ts, "").await;
+                        if output.is_error {
+                            let _ = proc_slack.reply_in_thread(&thread_ts, &format!("⚠️ {}", output.text)).await;
+                        } else {
+                            post_claude_output_in_thread(&proc_slack, &thread_ts, &output).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proc_slack.set_status_in_thread(&thread_ts, "").await;
+                        let _ = proc_slack.reply_in_thread(&thread_ts, &format!("❌ btw 执行失败: {}", e)).await;
+                    }
                 }
             }
         }

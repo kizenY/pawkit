@@ -1,7 +1,7 @@
 use crate::plog;
 use crate::claude_session::{ClaudeOutput, ClaudeSession};
 use crate::config::AutoReviewConfig;
-use crate::slack_bridge::SlackBridge;
+use crate::slack_bridge::{SessionThreadMap, SlackBridge};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -89,6 +89,9 @@ pub struct ReviewItem {
     pub is_own_pr: bool,
     #[serde(default)]
     pub notification_id: String,
+    /// Slack thread_ts for posting review results (set when notified in away mode)
+    #[serde(default)]
+    pub slack_thread_ts: Option<String>,
 }
 
 /// Tracks which items we've already notified about
@@ -112,6 +115,7 @@ pub fn start_auto_review(
     slack: Option<Arc<SlackBridge>>,
     is_away: Arc<AtomicBool>,
     manual_trigger: ManualPollTrigger,
+    session_thread_map: SessionThreadMap,
 ) {
     if !config.enabled {
         plog!("[Pawkit] Auto-review disabled");
@@ -187,7 +191,7 @@ pub fn start_auto_review(
         });
 
         // Task 2: Process approved items with Claude Code
-        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away, &client2).await;
+        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away, &client2, session_thread_map).await;
     });
 
     // Store the sender so approved items can be sent from the Tauri command
@@ -212,13 +216,14 @@ pub fn get_approved_sender() -> Option<ApprovedTx> {
     }
 }
 
-/// Notify about a review item — via Slack in away mode, via cat UI in home mode
+/// Notify about a review item — via Slack in away mode, via cat UI in home mode.
+/// Returns the Slack thread_ts if posted in away mode.
 async fn notify_review_item(
     app_handle: &tauri::AppHandle,
     item: &ReviewItem,
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
-) {
+) -> Option<String> {
     let type_label = if item.is_own_pr {
         "My PR Update"
     } else {
@@ -230,21 +235,31 @@ async fn notify_review_item(
         }
     };
 
+    let mut thread_ts = None;
     if is_away.load(Ordering::SeqCst) {
         if let Some(ref slack) = slack {
             let msg = format!(
-                "📋 *{}*: `{}` #{}\n_{}_",
+                "📋 *{}*: `{}` #{}\n_{}_\n_🔍 即将自动开始审查..._",
                 type_label, item.repo, item.pr_number, item.title
             );
-            let _ = slack.post_top_message(&msg).await;
+            match slack.post_top_message(&msg).await {
+                Ok(ts) => {
+                    plog!("[Pawkit] PR notification posted, thread_ts={}", ts);
+                    thread_ts = Some(ts);
+                }
+                Err(e) => {
+                    plog!("[Pawkit] Failed to post PR notification: {}", e);
+                }
+            }
         }
     }
 
     // Always emit to frontend (in case user switches back to home mode)
     let _ = app_handle.emit("review_item_found", item);
+    thread_ts
 }
 
-/// Post Claude Code output to Slack
+/// Post Claude Code output to Slack (thread-aware)
 async fn post_review_result_to_slack(
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
@@ -258,18 +273,18 @@ async fn post_review_result_to_slack(
 
     let type_label = if item.is_own_pr { "PR Feedback" } else { "Review" };
     let header = format!("✅ *{} complete*: `{}` #{}", type_label, item.repo, item.pr_number);
-    let _ = slack.reply(&header).await;
+    let _ = review_reply(slack, &item.slack_thread_ts, &header).await;
 
     // Post the output (truncated)
     let text = &output.text;
     if !text.is_empty() {
         let truncated: String = text.chars().take(2000).collect();
-        let _ = slack.reply(&truncated).await;
+        let _ = review_reply(slack, &item.slack_thread_ts, &truncated).await;
     }
 
     if let Some(cost) = output.cost_usd {
         if let Some(dur) = output.duration_ms {
-            let _ = slack.reply(&format!("💰 ${:.4} ⏱ {:.1}s", cost, dur as f64 / 1000.0)).await;
+            let _ = review_reply(slack, &item.slack_thread_ts, &format!("💰 ${:.4} ⏱ {:.1}s", cost, dur as f64 / 1000.0)).await;
         }
     }
 }
@@ -285,10 +300,18 @@ async fn post_review_error_to_slack(
     }
     let Some(ref slack) = slack else { return };
 
-    let _ = slack.reply(&format!(
+    let _ = review_reply(slack, &item.slack_thread_ts, &format!(
         "❌ Review failed: `{}` #{}\n```{}```",
         item.repo, item.pr_number, error
     )).await;
+}
+
+/// Helper: reply in the review's Slack thread if available, otherwise use active thread
+async fn review_reply(slack: &SlackBridge, thread_ts: &Option<String>, msg: &str) -> Result<String, String> {
+    match thread_ts {
+        Some(ts) => slack.reply_in_thread(ts, msg).await,
+        None => slack.reply(msg).await,
+    }
 }
 
 /// Poll GitHub notifications for PR-related items.
@@ -304,13 +327,13 @@ async fn poll_github(
 ) -> Result<(), String> {
     plog!("[Pawkit] Polling GitHub notifications...");
 
-    // Use all=true to include read notifications (new activity changes updated_at,
-    // caught by seen set). participating=true limits to threads we're involved in.
+    // Only fetch unread notifications. GitHub automatically marks notifications as
+    // unread again when there's new activity, so we don't miss updates.
+    // Using all=true would incorrectly re-surface already-read notifications.
     let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let resp = client
         .get("https://api.github.com/notifications")
         .query(&[
-            ("all", "true"),
             ("participating", "true"),
             ("since", since.as_str()),
             ("per_page", "50"),
@@ -418,7 +441,7 @@ async fn poll_github(
             _ => "comment",
         };
 
-        let item = ReviewItem {
+        let mut item = ReviewItem {
             id,
             repo: repo.clone(),
             pr_number,
@@ -428,13 +451,25 @@ async fn poll_github(
             body: comment_body,
             is_own_pr,
             notification_id: notif_id,
+            slack_thread_ts: None,
         };
 
         plog!("[Pawkit] Found PR notification: {} #{} (own={}, reason={})",
             repo, pr_number, is_own_pr, reason);
-        pending.lock().await.push(item.clone());
         seen.lock().await.insert(item.id.clone());
-        notify_review_item(app_handle, &item, slack, is_away).await;
+        let thread_ts = notify_review_item(app_handle, &item, slack, is_away).await;
+
+        if is_away.load(Ordering::SeqCst) {
+            // In away mode: auto-approve and start review immediately
+            item.slack_thread_ts = thread_ts;
+            if let Some(tx) = get_approved_sender() {
+                plog!("[Pawkit] Auto-approving review in away mode: {} #{}", item.repo, item.pr_number);
+                let _ = tx.send(item).await;
+            }
+        } else {
+            // In home mode: add to pending for UI approval
+            pending.lock().await.push(item);
+        }
     }
 
     Ok(())
@@ -539,14 +574,27 @@ async fn process_approved_items(
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
     client: &reqwest::Client,
+    session_thread_map: SessionThreadMap,
 ) {
     while let Some(item) = rx.recv().await {
         plog!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
 
+        // Set active thread to this review's Slack thread (for auth button routing)
+        if let Some(ref ts) = item.slack_thread_ts {
+            if let Some(ref s) = slack {
+                s.set_active_thread(ts).await;
+            }
+        }
+
         // Notify Slack that we're starting
         if is_away.load(Ordering::SeqCst) {
             if let Some(ref s) = slack {
-                let _ = s.set_status("🔍 Reviewing PR...").await;
+                let _ = review_reply(s, &item.slack_thread_ts, "🔍 _开始审查..._").await;
+                if let Some(ref ts) = item.slack_thread_ts {
+                    let _ = s.set_status_in_thread(ts, "🔍 Reviewing PR...").await;
+                } else {
+                    let _ = s.set_status("🔍 Reviewing PR...").await;
+                }
             }
         }
 
@@ -563,6 +611,14 @@ async fn process_approved_items(
                     item.repo, item.pr_number,
                     &output.text[..output.text.len().min(200)]);
 
+                // Register review session in thread map so hooks route correctly
+                if let Some(ref sid) = output.session_id {
+                    if let Some(ref ts) = item.slack_thread_ts {
+                        session_thread_map.lock().await.insert(sid.clone(), ts.clone());
+                        plog!("[Pawkit] Registered review session {} → thread {}", sid, ts);
+                    }
+                }
+
                 // Post result to Slack in away mode
                 post_review_result_to_slack(slack, is_away, &item, &output).await;
 
@@ -575,7 +631,7 @@ async fn process_approved_items(
                             plog!("[Pawkit] Auto-merged {} #{}", item.repo, item.pr_number);
                             if is_away.load(Ordering::SeqCst) {
                                 if let Some(ref s) = slack {
-                                    let _ = s.reply(&format!(
+                                    let _ = review_reply(s, &item.slack_thread_ts, &format!(
                                         "🎉 *Auto-merged*: `{}` #{}", item.repo, item.pr_number
                                     )).await;
                                 }
@@ -616,7 +672,11 @@ async fn process_approved_items(
         // Clear Slack status
         if is_away.load(Ordering::SeqCst) {
             if let Some(ref s) = slack {
-                let _ = s.clear_status().await;
+                if let Some(ref ts) = item.slack_thread_ts {
+                    let _ = s.set_status_in_thread(ts, "").await;
+                } else {
+                    let _ = s.clear_status().await;
+                }
             }
         }
     }

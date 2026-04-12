@@ -257,7 +257,7 @@ fn execute_claude(action: &Action) -> ExecResult {
         const DETACHED_PROCESS: u32 = 0x00000008;
         let mut cmd = Command::new("wt");
         let raw = format!(
-            r#"new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
+            r#"-w 0 new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude""#,
             workdir = workdir,
             bash = bash_path,
         );
@@ -427,6 +427,65 @@ fn run_command(mut cmd: Command) -> ExecResult {
     let exit_code = output.status.code();
 
     Ok((stdout, stderr, exit_code))
+}
+
+/// Launch a new terminal that resumes a specific Claude Code session.
+pub fn launch_resume_terminal(session_id: &str, working_dir: &str) -> Result<(), String> {
+    let workdir = if working_dir.is_empty() {
+        dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    } else {
+        working_dir.to_string()
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let bash_path = find_git_bash()
+            .ok_or("Cannot find git-bash. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH")?;
+
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        let raw = format!(
+            r#"-w 0 new-tab -d "{workdir}" -- cmd /k "set CLAUDE_CODE_GIT_BASH_PATH={bash}&& claude --resume {sid}""#,
+            workdir = workdir,
+            bash = bash_path,
+            sid = session_id,
+        );
+        plog!("[launch_resume] spawning: wt {}", raw);
+        let mut cmd = Command::new("wt");
+        cmd.raw_arg(&raw);
+        cmd.creation_flags(DETACHED_PROCESS);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.spawn().map_err(|e| format!("Failed to launch terminal: {}", e))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            r#"tell application "Terminal"
+                activate
+                do script "cd '{}' && claude --resume {}"
+            end tell"#,
+            workdir, session_id
+        );
+        let mut cmd = Command::new("osascript");
+        cmd.args(["-e", &script]);
+        cmd.output().map_err(|e| format!("Failed to launch terminal: {}", e))?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", &format!(
+            r#"x-terminal-emulator -e bash -lic "claude --resume {}" 2>/dev/null || gnome-terminal -- bash -lic "claude --resume {}" 2>/dev/null || xterm -e bash -lic "claude --resume {}""#,
+            session_id, session_id, session_id
+        )]);
+        cmd.output().map_err(|e| format!("Failed to launch terminal: {}", e))?;
+        return Ok(());
+    }
 }
 
 fn resolve_env_vars(input: &str) -> String {
