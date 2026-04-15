@@ -1,6 +1,6 @@
 [package]
 name = "pawkit"
-version = "0.2.3"
+version = "0.3.0"
 description = "Desktop pet with customizable quick actions"
 authors = ["kizenY"]
 edition = "2021"

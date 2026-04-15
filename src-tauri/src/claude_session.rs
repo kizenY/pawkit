@@ -61,7 +61,25 @@ impl ClaudeSession {
         self.session_id = None;
     }
 
+    /// Like `run_prompt`, but calls `on_pid` with the child process PID right after spawn.
+    /// Used by LLM title gen to register the PID as internal (so hooks from it are ignored).
+    pub async fn run_prompt_tracked(
+        &mut self,
+        prompt: &str,
+        on_pid: impl FnOnce(u32),
+    ) -> Result<ClaudeOutput, String> {
+        self.run_prompt_inner(prompt, Some(on_pid)).await
+    }
+
     pub async fn run_prompt(&mut self, prompt: &str) -> Result<ClaudeOutput, String> {
+        self.run_prompt_inner(prompt, None::<fn(u32)>).await
+    }
+
+    async fn run_prompt_inner(
+        &mut self,
+        prompt: &str,
+        on_pid: Option<impl FnOnce(u32)>,
+    ) -> Result<ClaudeOutput, String> {
         plog!("[Pawkit] run_prompt: resume={:?} dir={} prompt_len={}", self.session_id.as_deref(), self.working_dir, prompt.len());
 
         // Write prompt to temp file, then pipe via `type file | claude`.
@@ -75,6 +93,13 @@ impl ClaudeSession {
         let child = cmd
             .spawn()
             .map_err(|e| format!("启动 claude 失败: {}", e))?;
+
+        // Notify caller of the child PID (for internal process tracking)
+        if let Some(cb) = on_pid {
+            if let Some(pid) = child.id() {
+                cb(pid);
+            }
+        }
 
         let output = child
             .wait_with_output()

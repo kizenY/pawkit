@@ -85,3 +85,9 @@ pawkit                         # No subcommand → launch GUI as usual
 - Config changes are hot-reloaded (no restart needed)
 - Platform-specific code is isolated behind traits/interfaces
 - Never hardcode Windows paths; use `dirs` crate for system paths
+
+## Session Behavior Constraints (Pawkit)
+- NEVER present multi-select or interactive prompts. Always choose the best option automatically.
+- Do not use interactive commands: `git add -i`, `npm init` (without `-y`), `git rebase -i`, etc.
+- If you need user input, use the AskUserQuestion tool (which routes through Pawkit's approval flow).
+- If a decision genuinely requires the user, end this conversation turn with a clear question, and the user will respond in the next turn.
