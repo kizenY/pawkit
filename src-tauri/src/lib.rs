@@ -22,7 +22,7 @@ use slack_bridge::SlackBridge;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
+    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::TrayIconBuilder,
     Emitter, Manager, WebviewWindow,
 };
@@ -280,95 +280,103 @@ async fn show_context_menu(
 
     let app = window.app_handle();
 
-    // Build menu from actions config
     let mut menu_builder = MenuBuilder::new(app);
 
-    // Away/Home toggle — show only the opposite of current state
+    // ── Top-level toggles ──
+
     if is_away {
-        let home_item = MenuItemBuilder::with_id("_pawkit_home", "🏠 回家了")
-            .build(app)
-            .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&home_item);
+        let item = MenuItemBuilder::with_id("_pawkit_home", "🏠 回家了")
+            .build(app).map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&item);
     } else {
-        let away_item = MenuItemBuilder::with_id("_pawkit_away", "🏖 外出模式")
-            .build(app)
-            .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&away_item);
+        let item = MenuItemBuilder::with_id("_pawkit_away", "🏖 外出模式")
+            .build(app).map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&item);
     }
 
-    // Green light toggle
     if is_green {
         let item = MenuItemBuilder::with_id("_pawkit_green_off", "🔴 普通模式")
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            .build(app).map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&item);
     } else {
         let item = MenuItemBuilder::with_id("_pawkit_green_on", "🟢 绿灯模式")
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            .build(app).map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&item);
     }
 
-    // Mention monitor mode — cycle through modes
-    let mention_label = match current_mention_mode {
-        mention_monitor::MentionMode::Monitor => "👂 @mention: 监听中",
-        mention_monitor::MentionMode::AutoReply => "🤖 @mention: 自动回复",
-        mention_monitor::MentionMode::Rest => "😴 @mention: 休息中",
-    };
-    let mention_next_id = match current_mention_mode {
-        mention_monitor::MentionMode::Rest => "_pawkit_mention_monitor",
-        mention_monitor::MentionMode::Monitor => "_pawkit_mention_auto",
-        mention_monitor::MentionMode::AutoReply => "_pawkit_mention_rest",
-    };
-    let mention_item = MenuItemBuilder::with_id(mention_next_id, mention_label)
-        .build(app)
-        .map_err(|e| e.to_string())?;
-    menu_builder = menu_builder.item(&mention_item);
+    menu_builder = menu_builder.separator();
 
+    // ── Slack 自动回复 submenu ──
+    {
+        // Modes: (enum, menu_id, label)
+        let all_modes: [(mention_monitor::MentionMode, &str, &str); 3] = [
+            (mention_monitor::MentionMode::AutoReply, "_pawkit_mention_auto", "自动回复"),
+            (mention_monitor::MentionMode::Monitor, "_pawkit_mention_monitor", "手动审批"),
+            (mention_monitor::MentionMode::Rest, "_pawkit_mention_rest", "停用"),
+        ];
+
+        let mut sub = SubmenuBuilder::new(app, "💬 Slack 自动回复");
+
+        // Current mode first (with ✓ marker, disabled)
+        for &(ref mode, id, label) in &all_modes {
+            if *mode == current_mention_mode {
+                let item = MenuItemBuilder::with_id(id, format!("{} ✓", label))
+                    .enabled(false)
+                    .build(app).map_err(|e| e.to_string())?;
+                sub = sub.item(&item);
+                break;
+            }
+        }
+        sub = sub.separator();
+        // Other modes
+        for &(ref mode, id, label) in &all_modes {
+            if *mode != current_mention_mode {
+                let item = MenuItemBuilder::with_id(id, label)
+                    .build(app).map_err(|e| e.to_string())?;
+                sub = sub.item(&item);
+            }
+        }
+
+        let submenu = sub.build().map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&submenu);
+    }
+
+    // Check PR
     let check_pr_item = MenuItemBuilder::with_id("_pawkit_check_pr", "🔍 Check PR")
-        .build(app)
-        .map_err(|e| e.to_string())?;
+        .build(app).map_err(|e| e.to_string())?;
     menu_builder = menu_builder.item(&check_pr_item);
 
-    // Recent sessions section
+    // ── Recent Sessions submenu ──
     {
         let store = session_store_state.lock().await;
         let recent = store.recent(5);
         if !recent.is_empty() {
             menu_builder = menu_builder.separator();
-            let header = MenuItemBuilder::with_id("_group_sessions", "  Recent Sessions  ")
-                .enabled(false)
-                .build(app)
-                .map_err(|e| e.to_string())?;
-            menu_builder = menu_builder.item(&header);
+            let mut sub = SubmenuBuilder::new(app, "📋 最近会话");
             for record in recent {
                 let dir_name = std::path::Path::new(&record.working_dir)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let title = if record.title.is_empty() { &dir_name } else { &record.title };
-                let label = format!("  {} ({})", title, dir_name);
+                let label = format!("{} ({})", title, dir_name);
                 let item = MenuItemBuilder::with_id(
                     format!("_pawkit_resume_{}", record.session_id),
                     label,
-                )
-                .build(app)
-                .map_err(|e| e.to_string())?;
-                menu_builder = menu_builder.item(&item);
+                ).build(app).map_err(|e| e.to_string())?;
+                sub = sub.item(&item);
             }
+            let submenu = sub.build().map_err(|e| e.to_string())?;
+            menu_builder = menu_builder.item(&submenu);
         }
     }
 
-    menu_builder = menu_builder.separator();
-
-    // Group actions
+    // ── Actions (grouped → submenu, ungrouped → flat) ──
     let mut groups: std::collections::BTreeMap<String, Vec<&config::Action>> = std::collections::BTreeMap::new();
     let mut ungrouped: Vec<&config::Action> = Vec::new();
 
     for action in &actions {
-        if !action.enabled {
-            continue;
-        }
+        if !action.enabled { continue; }
         if let Some(ref group) = action.group {
             groups.entry(group.clone()).or_default().push(action);
         } else {
@@ -376,67 +384,51 @@ async fn show_context_menu(
         }
     }
 
-    // Add ungrouped items first
+    if !ungrouped.is_empty() || !groups.is_empty() {
+        menu_builder = menu_builder.separator();
+    }
+
     for action in &ungrouped {
         let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
         let item = MenuItemBuilder::with_id(&action.id, label)
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            .build(app).map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&item);
     }
 
-    // Add grouped items with submenu headers
     for (group_name, group_actions) in &groups {
-        if !ungrouped.is_empty() || groups.len() > 1 {
-            menu_builder = menu_builder.separator();
-        }
-        // Add group label as disabled item
-        let group_label = MenuItemBuilder::with_id(
-            format!("_group_{}", group_name),
-            format!("  {}  ", group_name),
-        )
-        .enabled(false)
-        .build(app)
-        .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&group_label);
-
+        let mut sub = SubmenuBuilder::new(app, group_name.as_str());
         for action in group_actions {
             let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
             let item = MenuItemBuilder::with_id(&action.id, label)
-                .build(app)
-                .map_err(|e| e.to_string())?;
-            menu_builder = menu_builder.item(&item);
+                .build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
         }
+        let submenu = sub.build().map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&submenu);
     }
 
-    // Add separator and Exit/Quit
+    // ── Exit / Quit ──
     menu_builder = menu_builder.separator();
     let has_active_sessions = !active_sessions.lock().await.is_empty();
     if let Some(ref sid) = session_id {
         if has_active_sessions {
-            // Right-clicking a specific cat with active session → "Exit Session"
             let item = MenuItemBuilder::with_id(
                 format!("_pawkit_kill_{}", sid),
                 "❌ 退出会话",
-            )
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            ).build(app).map_err(|e| e.to_string())?;
             menu_builder = menu_builder.item(&item);
         } else {
-            let quit_item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
-                .build(app)
-                .map_err(|e| e.to_string())?;
-            menu_builder = menu_builder.item(&quit_item);
+            let item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
+                .build(app).map_err(|e| e.to_string())?;
+            menu_builder = menu_builder.item(&item);
         }
     } else {
-        let quit_item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
-            .build(app)
-            .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&quit_item);
+        let item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
+            .build(app).map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&item);
     }
 
     let menu = menu_builder.build().map_err(|e| e.to_string())?;
-
     window.popup_menu(&menu).map_err(|e| e.to_string())?;
 
     Ok(())
