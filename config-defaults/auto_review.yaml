@@ -4,7 +4,7 @@
 #
 # Config location: %APPDATA%/pawkit/auto_review.yaml
 
-enabled: false
+enabled: true
 interval_minutes: 5
 
 # Auto-merge PRs after successful review? (default: false)

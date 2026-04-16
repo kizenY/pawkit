@@ -97,6 +97,10 @@ pub struct ReviewItem {
 /// Tracks which items we've already notified about
 type SeenItems = Arc<Mutex<HashSet<String>>>;
 
+/// Tracks the last-reviewed HEAD commit SHA per PR, keyed by "repo#pr_number".
+/// Used to skip redundant reviews when no new commits have been pushed.
+type ReviewedCommits = Arc<Mutex<std::collections::HashMap<String, String>>>;
+
 /// Channel for approved items waiting to be processed
 type ApprovedTx = mpsc::Sender<ReviewItem>;
 type ApprovedRx = mpsc::Receiver<ReviewItem>;
@@ -129,6 +133,7 @@ pub fn start_auto_review(
 
     let (approved_tx, approved_rx) = mpsc::channel::<ReviewItem>(32);
     let seen: SeenItems = Arc::new(Mutex::new(HashSet::new()));
+    let reviewed_commits: ReviewedCommits = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     // Get GitHub token once and share client across both tasks
     let poll_handle = app_handle.clone();
@@ -191,7 +196,7 @@ pub fn start_auto_review(
         });
 
         // Task 2: Process approved items with Claude Code
-        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away, &client2, session_thread_map).await;
+        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away, &client2, session_thread_map, reviewed_commits).await;
     });
 
     // Store the sender so approved items can be sent from the Tauri command
@@ -505,6 +510,18 @@ async fn mark_notification_read(client: &reqwest::Client, thread_id: &str) {
     }
 }
 
+/// Fetch the HEAD commit SHA of a PR (the latest pushed commit).
+async fn get_pr_head_sha(client: &reqwest::Client, repo: &str, pr_number: u64) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{}/pulls/{}", repo, pr_number);
+    let resp = client.get(&url).send().await
+        .map_err(|e| format!("Failed to fetch PR head SHA: {}", e))?;
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse PR data: {}", e))?;
+    data["head"]["sha"].as_str()
+        .map(String::from)
+        .ok_or_else(|| "No head SHA in PR data".to_string())
+}
+
 /// Lazily-initialized GitHub client for use outside the poll loop (e.g. skip_review_item).
 /// Created once, reused for all subsequent calls.
 static SHARED_CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
@@ -575,6 +592,7 @@ async fn process_approved_items(
     is_away: &Arc<AtomicBool>,
     client: &reqwest::Client,
     session_thread_map: SessionThreadMap,
+    reviewed_commits: ReviewedCommits,
 ) {
     while let Some(item) = rx.recv().await {
         plog!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
@@ -583,6 +601,46 @@ async fn process_approved_items(
         if let Some(ref ts) = item.slack_thread_ts {
             if let Some(ref s) = slack {
                 s.set_active_thread(ts).await;
+            }
+        }
+
+        // --- Skip review if no new commits since last review (reviewer only) ---
+        if !item.is_own_pr {
+            let pr_key = format!("{}#{}", item.repo, item.pr_number);
+            match get_pr_head_sha(client, &item.repo, item.pr_number).await {
+                Ok(head_sha) => {
+                    let last_sha = reviewed_commits.lock().await.get(&pr_key).cloned();
+                    if let Some(ref prev) = last_sha {
+                        if prev == &head_sha {
+                            plog!("[Pawkit] Skipping review {} #{}: HEAD unchanged ({})",
+                                item.repo, item.pr_number, &head_sha[..8.min(head_sha.len())]);
+
+                            if is_away.load(Ordering::SeqCst) {
+                                if let Some(ref s) = slack {
+                                    let _ = review_reply(s, &item.slack_thread_ts, &format!(
+                                        "⏭️ _跳过审查_: `{}` #{} — 上次审查后无新提交 (`{}`)",
+                                        item.repo, item.pr_number, &head_sha[..8.min(head_sha.len())]
+                                    )).await;
+                                }
+                            }
+
+                            // Mark notification as read and emit done
+                            if !item.notification_id.is_empty() {
+                                mark_notification_read(client, &item.notification_id).await;
+                            }
+                            let _ = app_handle.emit("review_item_done", &serde_json::json!({
+                                "id": item.id,
+                                "merged": false,
+                                "skipped": true,
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    plog!("[Pawkit] Failed to fetch HEAD SHA for {} #{}: {}, proceeding with review",
+                        item.repo, item.pr_number, e);
+                }
             }
         }
 
@@ -649,6 +707,14 @@ async fn process_approved_items(
                 // Mark notification as read only on success
                 if !item.notification_id.is_empty() {
                     mark_notification_read(client, &item.notification_id).await;
+                }
+
+                // Record reviewed HEAD SHA so we can skip if no new commits next time
+                if !item.is_own_pr {
+                    let pr_key = format!("{}#{}", item.repo, item.pr_number);
+                    if let Ok(sha) = get_pr_head_sha(client, &item.repo, item.pr_number).await {
+                        reviewed_commits.lock().await.insert(pr_key, sha);
+                    }
                 }
 
                 let _ = app_handle.emit("review_item_done", &serde_json::json!({

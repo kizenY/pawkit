@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Semaphore};
 
 use std::time::Instant;
 
@@ -97,6 +97,8 @@ struct AppState {
     internal_pids: Arc<Mutex<HashSet<u32>>>,
     /// Maps Claude session_id → Slack thread_ts for per-session notification routing
     session_thread_map: SessionThreadMap,
+    /// Serialize LLM title generation to avoid concurrent `claude -p` interference
+    llm_title_semaphore: Arc<Semaphore>,
 }
 
 /// Summarize tool input into a short readable string
@@ -334,6 +336,7 @@ async fn try_discover_session(state: &AppState, session_id: &str) {
             state.active_sessions.clone(),
             state.session_store.clone(),
             state.internal_pids.clone(),
+            state.llm_title_semaphore.clone(),
         );
     }
 }
@@ -683,6 +686,7 @@ pub fn start_hook_server(
     active_sessions: ActiveSessions,
     internal_pids: Arc<Mutex<HashSet<u32>>>,
     session_thread_map: SessionThreadMap,
+    llm_title_semaphore: Arc<Semaphore>,
 ) {
     let state = AppState {
         pending,
@@ -699,6 +703,7 @@ pub fn start_hook_server(
         active_sessions,
         internal_pids,
         session_thread_map,
+        llm_title_semaphore,
     };
 
     let app = Router::new()
@@ -794,6 +799,7 @@ pub async fn scan_existing_sessions(
     active_sessions: &ActiveSessions,
     session_store: &Arc<Mutex<SessionStore>>,
     internal_pids: &Arc<Mutex<HashSet<u32>>>,
+    llm_title_semaphore: &Arc<Semaphore>,
 ) {
     let sessions_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("sessions"),
@@ -898,6 +904,7 @@ pub async fn scan_existing_sessions(
                 active_sessions.clone(),
                 session_store.clone(),
                 internal_pids.clone(),
+                llm_title_semaphore.clone(),
             );
         }
     }
@@ -910,6 +917,7 @@ fn spawn_llm_title_refinement(
     active_sessions: ActiveSessions,
     session_store: Arc<Mutex<SessionStore>>,
     internal_pids: Arc<Mutex<HashSet<u32>>>,
+    semaphore: Arc<Semaphore>,
 ) {
     tokio::spawn(async move {
         // JSONL may not exist yet when the session is first discovered.
@@ -918,8 +926,10 @@ fn spawn_llm_title_refinement(
         for delay_secs in [2, 4, 8] {
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
             if let Some(p) = session_store::read_first_user_prompt(&session_id) {
-                prompt_text = Some(p);
-                break;
+                if !p.trim().is_empty() {
+                    prompt_text = Some(p);
+                    break;
+                }
             }
         }
         let prompt_text = match prompt_text {
@@ -929,6 +939,8 @@ fn spawn_llm_title_refinement(
                 return;
             }
         };
+        // Serialize LLM title generation to prevent concurrent `claude -p` interference
+        let _permit = semaphore.acquire().await;
         match generate_llm_title(&prompt_text, internal_pids).await {
             Some(title) => {
                 plog!("[Pawkit] LLM title for {}: {}", &session_id[..session_id.len().min(8)], title);
@@ -967,7 +979,8 @@ async fn generate_llm_title(
     let working_dir = std::env::temp_dir().to_string_lossy().to_string();
     let mut session = ClaudeSession::new(working_dir);
 
-    // Track the child PID so hooks from this process are filtered
+    // Track the child PID so hooks from this process are filtered.
+    // The semaphore ensures only one LLM title gen runs at a time, so try_lock() won't contend.
     let pids_clone = internal_pids.clone();
     let tracked_pid = Arc::new(std::sync::Mutex::new(None::<u32>));
     let tracked_clone = tracked_pid.clone();
@@ -979,6 +992,8 @@ async fn generate_llm_title(
             *tracked_clone.lock().unwrap() = Some(pid);
             if let Ok(mut set) = pids_clone.try_lock() {
                 set.insert(pid);
+            } else {
+                plog!("[Pawkit] WARNING: failed to register internal pid={}, phantom session may appear", pid);
             }
         }),
     ).await;

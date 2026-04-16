@@ -123,6 +123,9 @@ pub struct SlackConfig {
     pub output_buffer_ms: u64,
     #[serde(default)]
     pub critical_tools: Vec<String>,
+    /// Mention monitor mode: "monitor" (prompt approval), "auto_reply", or "rest" (off)
+    #[serde(default = "default_mention_mode")]
+    pub mention_mode: String,
 }
 
 fn default_working_dir() -> String {
@@ -132,6 +135,7 @@ fn default_working_dir() -> String {
 }
 fn default_poll_interval() -> u64 { 2000 }
 fn default_output_buffer() -> u64 { 1000 }
+fn default_mention_mode() -> String { "rest".to_string() }
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -290,6 +294,7 @@ impl Default for SlackConfig {
             poll_interval_ms: default_poll_interval(),
             output_buffer_ms: default_output_buffer(),
             critical_tools: vec!["Bash".to_string()],
+            mention_mode: default_mention_mode(),
         }
     }
 }
@@ -317,7 +322,7 @@ fn default_review_interval() -> u64 { 5 }
 impl Default for AutoReviewConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             interval_minutes: default_review_interval(),
             repos: Vec::new(),
             repo_dirs: HashMap::new(),

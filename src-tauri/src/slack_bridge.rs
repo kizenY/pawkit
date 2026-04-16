@@ -287,6 +287,72 @@ impl SlackBridge {
         Ok(())
     }
 
+    /// Post a message to any channel (not just DM), optionally in a thread
+    pub async fn post_in_channel(&self, channel: &str, thread_ts: Option<&str>, text: &str) -> Result<String, String> {
+        let mut body = serde_json::json!({
+            "channel": channel,
+            "text": text,
+        });
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = serde_json::Value::String(ts.to_string());
+        }
+        let data = self.api_post("chat.postMessage", &body).await?;
+        Ok(data["ts"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Fetch recent messages from a thread for context
+    pub async fn fetch_thread_messages(&self, channel: &str, thread_ts: &str, limit: usize) -> Result<Vec<serde_json::Value>, String> {
+        let data = self.api_post_get(
+            &format!("conversations.replies?channel={}&ts={}&limit={}&inclusive=true", channel, thread_ts, limit),
+        ).await?;
+        Ok(data["messages"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Fetch recent channel messages for context (when mention is not in a thread)
+    pub async fn fetch_channel_messages(&self, channel: &str, limit: usize) -> Result<Vec<serde_json::Value>, String> {
+        let data = self.api_post_get(
+            &format!("conversations.history?channel={}&limit={}", channel, limit),
+        ).await?;
+        Ok(data["messages"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Look up a user's display name by ID
+    pub async fn get_user_name(&self, user_id: &str) -> Result<String, String> {
+        let data = self.api_post_get(&format!("users.info?user={}", user_id)).await?;
+        let name = data["user"]["profile"]["display_name"].as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| data["user"]["profile"]["real_name"].as_str())
+            .or_else(|| data["user"]["name"].as_str())
+            .unwrap_or(user_id)
+            .to_string();
+        Ok(name)
+    }
+
+    /// GET-style Slack API call (for endpoints that use query params)
+    async fn api_post_get(&self, endpoint: &str) -> Result<serde_json::Value, String> {
+        let url = format!("https://slack.com/api/{}", endpoint);
+        let resp = self.client.get(&url).bearer_auth(&self.bot_token).send().await
+            .map_err(|e| format!("Slack API GET {} failed: {}", endpoint, e))?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        if data["ok"].as_bool() != Some(true) {
+            return Err(format!("Slack API {} error: {}", endpoint, data["error"]));
+        }
+        Ok(data)
+    }
+
+    pub fn get_bot_user_id(&self) -> Arc<Mutex<String>> {
+        self.bot_user_id.clone()
+    }
+
+    pub fn get_dm_channel_id(&self) -> Arc<Mutex<String>> {
+        self.dm_channel_id.clone()
+    }
+
+    /// Public wrapper for api_post — used by mention_monitor
+    pub async fn api_post_public(&self, method: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+        self.api_post(method, body).await
+    }
+
     async fn api_post(&self, method: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
         let url = format!("https://slack.com/api/{}", method);
         let resp = self.client.post(&url).bearer_auth(&self.bot_token).json(body).send().await
@@ -486,6 +552,8 @@ struct ButtonAction {
     channel_id: String,
     /// The original section text from the auth request message
     original_section: String,
+    /// The button's value field (used for mention_reply payloads)
+    value: String,
 }
 
 fn extract_button_action(envelope: &serde_json::Value) -> Option<ButtonAction> {
@@ -493,6 +561,7 @@ fn extract_button_action(envelope: &serde_json::Value) -> Option<ButtonAction> {
     let actions = payload.get("actions")?.as_array()?;
     let action = actions.first()?;
     let action_id = action.get("action_id")?.as_str()?.to_string();
+    let value = action.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let message_ts = payload.get("message")?.get("ts")?.as_str()?.to_string();
     let channel_id = payload.get("channel")?.get("id")?.as_str()?.to_string();
 
@@ -507,7 +576,7 @@ fn extract_button_action(envelope: &serde_json::Value) -> Option<ButtonAction> {
         .unwrap_or("")
         .to_string();
 
-    Some(ButtonAction { action_id, message_ts, channel_id, original_section })
+    Some(ButtonAction { action_id, message_ts, channel_id, original_section, value })
 }
 
 // ── Main session loop ──
@@ -531,7 +600,7 @@ struct ThreadSession {
 }
 
 /// Known Pawkit commands that should NOT be forwarded to Claude Code
-const PAWKIT_COMMANDS: &[&str] = &["!ping", "!auto", "!green", "!cd", "!stop", "!status"];
+const PAWKIT_COMMANDS: &[&str] = &["!ping", "!auto", "!green", "!cd", "!stop", "!status", "!mention"];
 
 fn is_pawkit_command(text: &str) -> bool {
     let lower = text.to_lowercase();
@@ -547,6 +616,7 @@ pub async fn run_remote_session(
     green_light: Arc<AtomicBool>,
     active_sessions: ActiveSessions,
     session_thread_map: SessionThreadMap,
+    mention_mode: crate::mention_monitor::SharedMentionMode,
 ) {
     if let Err(e) = slack.init().await {
         plog!("[Pawkit] Slack init failed: {}", e);
@@ -561,6 +631,7 @@ pub async fn run_remote_session(
          新消息 = 新建会话 thread\n\
          thread 回复 = 继续该会话\n\n\
          `!ping` `!auto on/off` `!green on/off` `!stop` `!status`\n\
+         `!mention monitor/auto/rest` @提及监控\n\
          `/btw <msg>` 追加消息 | `!命令` → Claude Code `/命令`",
         config.working_dir
     )).await {
@@ -607,6 +678,8 @@ pub async fn run_remote_session(
     let ws_green = green_light.clone();
     let ws_thread_map = session_thread_map.clone();
     let ws_active = active_sessions.clone();
+    let ws_mention_mode = mention_mode.clone();
+    let ws_config = config.clone();
 
     let listener = tokio::spawn(async move {
         while ws_away.load(Ordering::SeqCst) {
@@ -675,6 +748,43 @@ pub async fn run_remote_session(
                 // Button clicks — update original message in-place (grey out buttons)
                 if env_type == "interactive" {
                     if let Some(action) = extract_button_action(&envelope) {
+                        // Handle mention monitor buttons
+                        if action.action_id == "mention_reply" || action.action_id == "mention_skip" {
+                            let (emoji, label) = if action.action_id == "mention_reply" {
+                                ("🤖", "正在回复...")
+                            } else {
+                                ("⏭", "已跳过")
+                            };
+                            let updated_blocks = serde_json::json!([
+                                {
+                                    "type": "section",
+                                    "text": { "type": "mrkdwn", "text": action.original_section }
+                                },
+                                {
+                                    "type": "context",
+                                    "elements": [{ "type": "mrkdwn", "text": format!("{} _{}_", emoji, label) }]
+                                }
+                            ]);
+                            let _ = ws_slack.update_message(
+                                &action.channel_id, &action.message_ts,
+                                &format!("{} {}", emoji, label), &updated_blocks,
+                            ).await;
+
+                            if action.action_id == "mention_reply" {
+                                let reply_slack = ws_slack.clone();
+                                let reply_config = ws_config.clone();
+                                let reply_value = action.value.clone();
+                                let dm_uid = ws_slack.dm_user_id.clone();
+                                tokio::spawn(async move {
+                                    crate::mention_monitor::handle_mention_reply_button(
+                                        reply_slack, &reply_value, &reply_config, &dm_uid,
+                                    ).await;
+                                });
+                            }
+                            continue;
+                        }
+
+                        // Handle auth buttons
                         let allow = action.action_id == "auth_allow";
                         if resolve_first_pending(&ws_pending, allow).await {
                             let (emoji, label) = if allow { ("✅", "已允许") } else { ("❌", "已拒绝") };
@@ -744,6 +854,32 @@ pub async fn run_remote_session(
                 if lower == "!green off" {
                     ws_green.store(false, Ordering::SeqCst);
                     let _ = ws_slack.reply_in_thread(reply_thread, "🔴 绿灯模式已关闭").await;
+                    continue;
+                }
+                // !mention — change mention monitor mode
+                if lower.starts_with("!mention") {
+                    let arg = lower.strip_prefix("!mention").unwrap().trim();
+                    match arg {
+                        "monitor" | "on" => {
+                            *ws_mention_mode.lock().await = crate::mention_monitor::MentionMode::Monitor;
+                            let _ = ws_slack.reply_in_thread(reply_thread, "👂 @mention 监听模式已开启").await;
+                        }
+                        "auto" | "auto_reply" => {
+                            *ws_mention_mode.lock().await = crate::mention_monitor::MentionMode::AutoReply;
+                            let _ = ws_slack.reply_in_thread(reply_thread, "🤖 @mention 自动回复已开启").await;
+                        }
+                        "rest" | "off" => {
+                            *ws_mention_mode.lock().await = crate::mention_monitor::MentionMode::Rest;
+                            let _ = ws_slack.reply_in_thread(reply_thread, "😴 @mention 休息模式").await;
+                        }
+                        _ => {
+                            let current = ws_mention_mode.lock().await.label();
+                            let _ = ws_slack.reply_in_thread(reply_thread, &format!(
+                                "📡 当前: *{}*\n`!mention monitor` 监听 | `!mention auto` 自动回复 | `!mention rest` 休息",
+                                current
+                            )).await;
+                        }
+                    }
                     continue;
                 }
                 // !status — list active sessions and their threads

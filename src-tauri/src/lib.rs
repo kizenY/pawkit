@@ -6,6 +6,7 @@ mod hook_server;
 mod claude_session;
 #[macro_use]
 mod logger;
+mod mention_monitor;
 pub mod session_store;
 mod slack_bridge;
 mod win_focus;
@@ -21,7 +22,7 @@ use slack_bridge::SlackBridge;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
+    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::TrayIconBuilder,
     Emitter, Manager, WebviewWindow,
 };
@@ -265,6 +266,7 @@ async fn show_context_menu(
     state: tauri::State<'_, SharedConfig>,
     away_flag: tauri::State<'_, AwayFlag>,
     green_flag: tauri::State<'_, GreenLightFlag>,
+    mention_mode_state: tauri::State<'_, mention_monitor::SharedMentionMode>,
     session_store_state: tauri::State<'_, Arc<tokio::sync::Mutex<SessionStore>>>,
     active_sessions: tauri::State<'_, hook_server::ActiveSessions>,
 ) -> Result<(), String> {
@@ -274,82 +276,107 @@ async fn show_context_menu(
     };
     let is_away = away_flag.0.load(Ordering::SeqCst);
     let is_green = green_flag.0.load(Ordering::SeqCst);
+    let current_mention_mode = mention_mode_state.lock().await.clone();
 
     let app = window.app_handle();
 
-    // Build menu from actions config
     let mut menu_builder = MenuBuilder::new(app);
 
-    // Away/Home toggle — show only the opposite of current state
+    // ── Top-level toggles ──
+
     if is_away {
-        let home_item = MenuItemBuilder::with_id("_pawkit_home", "🏠 回家了")
-            .build(app)
-            .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&home_item);
+        let item = MenuItemBuilder::with_id("_pawkit_home", "🏠 回家了")
+            .build(app).map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&item);
     } else {
-        let away_item = MenuItemBuilder::with_id("_pawkit_away", "🏖 外出模式")
-            .build(app)
-            .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&away_item);
+        let item = MenuItemBuilder::with_id("_pawkit_away", "🏖 外出模式")
+            .build(app).map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&item);
     }
 
-    // Green light toggle
     if is_green {
         let item = MenuItemBuilder::with_id("_pawkit_green_off", "🔴 普通模式")
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            .build(app).map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&item);
     } else {
         let item = MenuItemBuilder::with_id("_pawkit_green_on", "🟢 绿灯模式")
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            .build(app).map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&item);
     }
 
+    menu_builder = menu_builder.separator();
+
+    // ── Slack 自动回复 submenu ──
+    {
+        // Modes: (enum, menu_id, label)
+        let all_modes: [(mention_monitor::MentionMode, &str, &str); 3] = [
+            (mention_monitor::MentionMode::AutoReply, "_pawkit_mention_auto", "自动回复"),
+            (mention_monitor::MentionMode::Monitor, "_pawkit_mention_monitor", "手动审批"),
+            (mention_monitor::MentionMode::Rest, "_pawkit_mention_rest", "停用"),
+        ];
+
+        let mut sub = SubmenuBuilder::new(app, "💬 Slack 自动回复");
+
+        // Current mode first (with ✓ marker, disabled)
+        for &(ref mode, id, label) in &all_modes {
+            if *mode == current_mention_mode {
+                let item = MenuItemBuilder::with_id(id, format!("{} ✓", label))
+                    .enabled(false)
+                    .build(app).map_err(|e| e.to_string())?;
+                sub = sub.item(&item);
+                break;
+            }
+        }
+        sub = sub.separator();
+        // Other modes
+        for &(ref mode, id, label) in &all_modes {
+            if *mode != current_mention_mode {
+                let item = MenuItemBuilder::with_id(id, label)
+                    .build(app).map_err(|e| e.to_string())?;
+                sub = sub.item(&item);
+            }
+        }
+
+        let submenu = sub.build().map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&submenu);
+    }
+
+    // Check PR
     let check_pr_item = MenuItemBuilder::with_id("_pawkit_check_pr", "🔍 Check PR")
-        .build(app)
-        .map_err(|e| e.to_string())?;
+        .build(app).map_err(|e| e.to_string())?;
     menu_builder = menu_builder.item(&check_pr_item);
 
-    // Recent sessions section
+    // ── Recent Sessions submenu ──
     {
         let store = session_store_state.lock().await;
         let recent = store.recent(5);
         if !recent.is_empty() {
             menu_builder = menu_builder.separator();
-            let header = MenuItemBuilder::with_id("_group_sessions", "  Recent Sessions  ")
-                .enabled(false)
-                .build(app)
-                .map_err(|e| e.to_string())?;
-            menu_builder = menu_builder.item(&header);
+            let mut sub = SubmenuBuilder::new(app, "📋 最近会话");
             for record in recent {
                 let dir_name = std::path::Path::new(&record.working_dir)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let title = if record.title.is_empty() { &dir_name } else { &record.title };
-                let label = format!("  {} ({})", title, dir_name);
+                let label = format!("{} ({})", title, dir_name);
                 let item = MenuItemBuilder::with_id(
                     format!("_pawkit_resume_{}", record.session_id),
                     label,
-                )
-                .build(app)
-                .map_err(|e| e.to_string())?;
-                menu_builder = menu_builder.item(&item);
+                ).build(app).map_err(|e| e.to_string())?;
+                sub = sub.item(&item);
             }
+            let submenu = sub.build().map_err(|e| e.to_string())?;
+            menu_builder = menu_builder.item(&submenu);
         }
     }
 
-    menu_builder = menu_builder.separator();
-
-    // Group actions
+    // ── Actions (grouped → submenu, ungrouped → flat) ──
     let mut groups: std::collections::BTreeMap<String, Vec<&config::Action>> = std::collections::BTreeMap::new();
     let mut ungrouped: Vec<&config::Action> = Vec::new();
 
     for action in &actions {
-        if !action.enabled {
-            continue;
-        }
+        if !action.enabled { continue; }
         if let Some(ref group) = action.group {
             groups.entry(group.clone()).or_default().push(action);
         } else {
@@ -357,67 +384,51 @@ async fn show_context_menu(
         }
     }
 
-    // Add ungrouped items first
+    if !ungrouped.is_empty() || !groups.is_empty() {
+        menu_builder = menu_builder.separator();
+    }
+
     for action in &ungrouped {
         let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
         let item = MenuItemBuilder::with_id(&action.id, label)
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            .build(app).map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&item);
     }
 
-    // Add grouped items with submenu headers
     for (group_name, group_actions) in &groups {
-        if !ungrouped.is_empty() || groups.len() > 1 {
-            menu_builder = menu_builder.separator();
-        }
-        // Add group label as disabled item
-        let group_label = MenuItemBuilder::with_id(
-            format!("_group_{}", group_name),
-            format!("  {}  ", group_name),
-        )
-        .enabled(false)
-        .build(app)
-        .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&group_label);
-
+        let mut sub = SubmenuBuilder::new(app, group_name.as_str());
         for action in group_actions {
             let label = format!("{} {}", action.icon.as_deref().unwrap_or(">"), action.name);
             let item = MenuItemBuilder::with_id(&action.id, label)
-                .build(app)
-                .map_err(|e| e.to_string())?;
-            menu_builder = menu_builder.item(&item);
+                .build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
         }
+        let submenu = sub.build().map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&submenu);
     }
 
-    // Add separator and Exit/Quit
+    // ── Exit / Quit ──
     menu_builder = menu_builder.separator();
     let has_active_sessions = !active_sessions.lock().await.is_empty();
     if let Some(ref sid) = session_id {
         if has_active_sessions {
-            // Right-clicking a specific cat with active session → "Exit Session"
             let item = MenuItemBuilder::with_id(
                 format!("_pawkit_kill_{}", sid),
                 "❌ 退出会话",
-            )
-            .build(app)
-            .map_err(|e| e.to_string())?;
+            ).build(app).map_err(|e| e.to_string())?;
             menu_builder = menu_builder.item(&item);
         } else {
-            let quit_item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
-                .build(app)
-                .map_err(|e| e.to_string())?;
-            menu_builder = menu_builder.item(&quit_item);
+            let item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
+                .build(app).map_err(|e| e.to_string())?;
+            menu_builder = menu_builder.item(&item);
         }
     } else {
-        let quit_item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
-            .build(app)
-            .map_err(|e| e.to_string())?;
-        menu_builder = menu_builder.item(&quit_item);
+        let item = MenuItemBuilder::with_id("_pawkit_quit", "退出 Pawkit")
+            .build(app).map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&item);
     }
 
     let menu = menu_builder.build().map_err(|e| e.to_string())?;
-
     window.popup_menu(&menu).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -665,6 +676,11 @@ pub fn run() {
             None
         };
 
+    // Mention monitor mode (from config, changeable at runtime)
+    let mention_mode: mention_monitor::SharedMentionMode = Arc::new(
+        tokio::sync::Mutex::new(mention_monitor::MentionMode::from_str(&slack_config.mention_mode))
+    );
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -677,6 +693,7 @@ pub fn run() {
         .manage(session_allow_tools.clone())
         .manage(pending_review_items.clone())
         .manage(manual_poll_trigger.clone())
+        .manage(mention_mode.clone())
         .invoke_handler(tauri::generate_handler![
             get_actions,
             get_pet_config,
@@ -725,6 +742,9 @@ pub fn run() {
             let app_handle = app.handle().clone();
             start_config_watcher(app_handle.clone(), shared_config.clone());
 
+            // Shared semaphore to serialize LLM title generation (prevents temp file race)
+            let llm_title_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
             // Start the HTTP hook server with away-mode support
             hook_server::start_hook_server(
                 app_handle.clone(),
@@ -742,6 +762,7 @@ pub fn run() {
                 active_sessions.clone(),
                 internal_pids.clone(),
                 session_thread_map.clone(),
+                llm_title_semaphore.clone(),
             );
 
             // Scan for existing Claude sessions on startup
@@ -750,10 +771,11 @@ pub fn run() {
                 let scan_sessions = active_sessions.clone();
                 let scan_store = session_store.clone();
                 let scan_internal = internal_pids.clone();
+                let scan_semaphore = llm_title_semaphore.clone();
                 tauri::async_runtime::spawn(async move {
                     // Short delay for internal setup; frontend pulls via get_active_sessions after this
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    hook_server::scan_existing_sessions(&scan_handle, &scan_sessions, &scan_store, &scan_internal).await;
+                    hook_server::scan_existing_sessions(&scan_handle, &scan_sessions, &scan_store, &scan_internal, &scan_semaphore).await;
                 });
             }
 
@@ -767,6 +789,26 @@ pub fn run() {
                 manual_poll_trigger.clone(),
                 session_thread_map.clone(),
             );
+
+            // Start mention monitor (independent of away mode)
+            if let Some(ref slack) = slack_bridge {
+                let monitor_slack = Arc::new(SlackBridge::new(
+                    slack_config.bot_token.clone(),
+                    slack_config.app_token.clone(),
+                    slack_config.dm_user_id.clone(),
+                ));
+                let monitor_mode = mention_mode.clone();
+                let monitor_config = slack_config.clone();
+                // The stop flag is never set — the monitor runs for the app's lifetime.
+                // Mode switching to Rest pauses processing without killing the task.
+                let monitor_stop = Arc::new(AtomicBool::new(false));
+                tauri::async_runtime::spawn(async move {
+                    mention_monitor::run_mention_monitor(
+                        monitor_slack, monitor_mode, monitor_config, monitor_stop,
+                    ).await;
+                });
+                plog!("[Pawkit] Mention monitor started (mode: {})", slack_config.mention_mode);
+            }
 
             // Poll foreground window to detect when user switches to Claude terminal
             let focus_handle = app_handle.clone();
@@ -867,6 +909,7 @@ pub fn run() {
             let active_sessions_menu = active_sessions.clone();
             let menu_trigger = manual_poll_trigger.clone();
             let session_thread_map = session_thread_map.clone();
+            let menu_mention_mode = mention_mode.clone();
             app.on_menu_event(move |app, event| {
                 let id = event.id().as_ref().to_string();
 
@@ -897,6 +940,31 @@ pub fn run() {
                 if id == "_pawkit_check_pr" {
                     menu_trigger.notify_one();
                     plog!("[Pawkit] Manual check-pr triggered from menu");
+                    return;
+                }
+                // Mention monitor mode switching
+                if id == "_pawkit_mention_monitor" {
+                    let mm = menu_mention_mode.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *mm.lock().await = mention_monitor::MentionMode::Monitor;
+                    });
+                    plog!("[Pawkit] @mention 监听模式已开启");
+                    return;
+                }
+                if id == "_pawkit_mention_auto" {
+                    let mm = menu_mention_mode.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *mm.lock().await = mention_monitor::MentionMode::AutoReply;
+                    });
+                    plog!("[Pawkit] @mention 自动回复已开启");
+                    return;
+                }
+                if id == "_pawkit_mention_rest" {
+                    let mm = menu_mention_mode.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *mm.lock().await = mention_monitor::MentionMode::Rest;
+                    });
+                    plog!("[Pawkit] @mention 休息模式");
                     return;
                 }
                 // Green light toggle
@@ -986,11 +1054,13 @@ pub fn run() {
                     let green_clone = menu_green.clone();
                     let active_clone = active_sessions_menu.clone();
                     let thread_map_clone = session_thread_map.clone();
+                    let mention_mode_clone = menu_mention_mode.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Some(slack) = slack_clone {
                             slack_bridge::run_remote_session(
                                 slack, pending_clone, away_flag, slack_config,
                                 store_clone, green_clone, active_clone, thread_map_clone,
+                                mention_mode_clone,
                             ).await;
                         }
                     });
