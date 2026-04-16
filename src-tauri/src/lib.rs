@@ -6,6 +6,7 @@ mod hook_server;
 mod claude_session;
 #[macro_use]
 mod logger;
+mod mention_monitor;
 pub mod session_store;
 mod slack_bridge;
 mod win_focus;
@@ -265,6 +266,7 @@ async fn show_context_menu(
     state: tauri::State<'_, SharedConfig>,
     away_flag: tauri::State<'_, AwayFlag>,
     green_flag: tauri::State<'_, GreenLightFlag>,
+    mention_mode_state: tauri::State<'_, mention_monitor::SharedMentionMode>,
     session_store_state: tauri::State<'_, Arc<tokio::sync::Mutex<SessionStore>>>,
     active_sessions: tauri::State<'_, hook_server::ActiveSessions>,
 ) -> Result<(), String> {
@@ -274,6 +276,7 @@ async fn show_context_menu(
     };
     let is_away = away_flag.0.load(Ordering::SeqCst);
     let is_green = green_flag.0.load(Ordering::SeqCst);
+    let current_mention_mode = mention_mode_state.lock().await.clone();
 
     let app = window.app_handle();
 
@@ -305,6 +308,22 @@ async fn show_context_menu(
             .map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&item);
     }
+
+    // Mention monitor mode — cycle through modes
+    let mention_label = match current_mention_mode {
+        mention_monitor::MentionMode::Monitor => "👂 @mention: 监听中",
+        mention_monitor::MentionMode::AutoReply => "🤖 @mention: 自动回复",
+        mention_monitor::MentionMode::Rest => "😴 @mention: 休息中",
+    };
+    let mention_next_id = match current_mention_mode {
+        mention_monitor::MentionMode::Rest => "_pawkit_mention_monitor",
+        mention_monitor::MentionMode::Monitor => "_pawkit_mention_auto",
+        mention_monitor::MentionMode::AutoReply => "_pawkit_mention_rest",
+    };
+    let mention_item = MenuItemBuilder::with_id(mention_next_id, mention_label)
+        .build(app)
+        .map_err(|e| e.to_string())?;
+    menu_builder = menu_builder.item(&mention_item);
 
     let check_pr_item = MenuItemBuilder::with_id("_pawkit_check_pr", "🔍 Check PR")
         .build(app)
@@ -665,6 +684,11 @@ pub fn run() {
             None
         };
 
+    // Mention monitor mode (from config, changeable at runtime)
+    let mention_mode: mention_monitor::SharedMentionMode = Arc::new(
+        tokio::sync::Mutex::new(mention_monitor::MentionMode::from_str(&slack_config.mention_mode))
+    );
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -677,6 +701,7 @@ pub fn run() {
         .manage(session_allow_tools.clone())
         .manage(pending_review_items.clone())
         .manage(manual_poll_trigger.clone())
+        .manage(mention_mode.clone())
         .invoke_handler(tauri::generate_handler![
             get_actions,
             get_pet_config,
@@ -725,6 +750,9 @@ pub fn run() {
             let app_handle = app.handle().clone();
             start_config_watcher(app_handle.clone(), shared_config.clone());
 
+            // Shared semaphore to serialize LLM title generation (prevents temp file race)
+            let llm_title_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
             // Start the HTTP hook server with away-mode support
             hook_server::start_hook_server(
                 app_handle.clone(),
@@ -742,6 +770,7 @@ pub fn run() {
                 active_sessions.clone(),
                 internal_pids.clone(),
                 session_thread_map.clone(),
+                llm_title_semaphore.clone(),
             );
 
             // Scan for existing Claude sessions on startup
@@ -750,10 +779,11 @@ pub fn run() {
                 let scan_sessions = active_sessions.clone();
                 let scan_store = session_store.clone();
                 let scan_internal = internal_pids.clone();
+                let scan_semaphore = llm_title_semaphore.clone();
                 tauri::async_runtime::spawn(async move {
                     // Short delay for internal setup; frontend pulls via get_active_sessions after this
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    hook_server::scan_existing_sessions(&scan_handle, &scan_sessions, &scan_store, &scan_internal).await;
+                    hook_server::scan_existing_sessions(&scan_handle, &scan_sessions, &scan_store, &scan_internal, &scan_semaphore).await;
                 });
             }
 
@@ -767,6 +797,26 @@ pub fn run() {
                 manual_poll_trigger.clone(),
                 session_thread_map.clone(),
             );
+
+            // Start mention monitor (independent of away mode)
+            if let Some(ref slack) = slack_bridge {
+                let monitor_slack = Arc::new(SlackBridge::new(
+                    slack_config.bot_token.clone(),
+                    slack_config.app_token.clone(),
+                    slack_config.dm_user_id.clone(),
+                ));
+                let monitor_mode = mention_mode.clone();
+                let monitor_config = slack_config.clone();
+                // The stop flag is never set — the monitor runs for the app's lifetime.
+                // Mode switching to Rest pauses processing without killing the task.
+                let monitor_stop = Arc::new(AtomicBool::new(false));
+                tauri::async_runtime::spawn(async move {
+                    mention_monitor::run_mention_monitor(
+                        monitor_slack, monitor_mode, monitor_config, monitor_stop,
+                    ).await;
+                });
+                plog!("[Pawkit] Mention monitor started (mode: {})", slack_config.mention_mode);
+            }
 
             // Poll foreground window to detect when user switches to Claude terminal
             let focus_handle = app_handle.clone();
@@ -867,6 +917,7 @@ pub fn run() {
             let active_sessions_menu = active_sessions.clone();
             let menu_trigger = manual_poll_trigger.clone();
             let session_thread_map = session_thread_map.clone();
+            let menu_mention_mode = mention_mode.clone();
             app.on_menu_event(move |app, event| {
                 let id = event.id().as_ref().to_string();
 
@@ -897,6 +948,31 @@ pub fn run() {
                 if id == "_pawkit_check_pr" {
                     menu_trigger.notify_one();
                     plog!("[Pawkit] Manual check-pr triggered from menu");
+                    return;
+                }
+                // Mention monitor mode switching
+                if id == "_pawkit_mention_monitor" {
+                    let mm = menu_mention_mode.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *mm.lock().await = mention_monitor::MentionMode::Monitor;
+                    });
+                    plog!("[Pawkit] @mention 监听模式已开启");
+                    return;
+                }
+                if id == "_pawkit_mention_auto" {
+                    let mm = menu_mention_mode.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *mm.lock().await = mention_monitor::MentionMode::AutoReply;
+                    });
+                    plog!("[Pawkit] @mention 自动回复已开启");
+                    return;
+                }
+                if id == "_pawkit_mention_rest" {
+                    let mm = menu_mention_mode.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *mm.lock().await = mention_monitor::MentionMode::Rest;
+                    });
+                    plog!("[Pawkit] @mention 休息模式");
                     return;
                 }
                 // Green light toggle
@@ -986,11 +1062,13 @@ pub fn run() {
                     let green_clone = menu_green.clone();
                     let active_clone = active_sessions_menu.clone();
                     let thread_map_clone = session_thread_map.clone();
+                    let mention_mode_clone = menu_mention_mode.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Some(slack) = slack_clone {
                             slack_bridge::run_remote_session(
                                 slack, pending_clone, away_flag, slack_config,
                                 store_clone, green_clone, active_clone, thread_map_clone,
+                                mention_mode_clone,
                             ).await;
                         }
                     });

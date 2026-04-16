@@ -9,6 +9,8 @@ pub struct ClaudeSession {
     /// Use --continue on first call (to inherit the local session)
     use_continue: bool,
     working_dir: String,
+    /// Optional model override (e.g. "sonnet" for cheaper/faster tasks)
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +28,17 @@ impl ClaudeSession {
             session_id: None,
             use_continue: false,
             working_dir,
+            model: None,
+        }
+    }
+
+    /// Create a session with a specific model (e.g. "sonnet")
+    pub fn new_with_model(working_dir: String, model: String) -> Self {
+        Self {
+            session_id: None,
+            use_continue: false,
+            working_dir,
+            model: Some(model),
         }
     }
 
@@ -36,6 +49,7 @@ impl ClaudeSession {
             session_id: None,
             use_continue: true,
             working_dir,
+            model: None,
         }
     }
 
@@ -45,6 +59,7 @@ impl ClaudeSession {
             session_id: Some(session_id),
             use_continue: false,
             working_dir,
+            model: None,
         }
     }
 
@@ -85,7 +100,8 @@ impl ClaudeSession {
         // Write prompt to temp file, then pipe via `type file | claude`.
         // This avoids cmd.exe mangling special characters (*, `, ", ^, |)
         // and Windows command line length limits (~32K chars).
-        let temp_file = std::env::temp_dir().join(format!("pawkit_prompt_{}.txt", std::process::id()));
+        // Use UUID suffix to prevent race conditions when multiple prompts run concurrently.
+        let temp_file = std::env::temp_dir().join(format!("pawkit_prompt_{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&temp_file, prompt).map_err(|e| format!("写入临时文件失败: {}", e))?;
 
         let mut cmd = self.build_command_piped(&temp_file);
@@ -202,6 +218,10 @@ impl ClaudeSession {
             "claude -p \"$(cat '{}')\" --output-format json",
             unix_path
         );
+
+        if let Some(ref model) = self.model {
+            shell_cmd.push_str(&format!(" --model {}", model));
+        }
 
         if let Some(ref sid) = self.session_id {
             shell_cmd.push_str(&format!(" --resume {}", sid));
