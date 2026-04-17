@@ -17,6 +17,8 @@ use hook_server::{AuthDecision, PendingRequests, SessionAllowTools};
 
 /// Wrapper so we can manage Arc<AtomicBool> as Tauri state for green light
 struct GreenLightFlag(Arc<AtomicBool>);
+struct AutoReviewEnabledFlag(Arc<AtomicBool>);
+struct AutoReviewModelState(Arc<tokio::sync::Mutex<Option<String>>>);
 use session_store::SessionStore;
 use slack_bridge::SlackBridge;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -252,6 +254,120 @@ async fn kill_session(
 }
 
 #[tauri::command]
+async fn quick_review(
+    url: String,
+    ar_model_state: tauri::State<'_, AutoReviewModelState>,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("URL 不能为空".to_string());
+    }
+    let model = ar_model_state.0.lock().await.clone();
+    plog!("[Pawkit] Quick review requested: {}", url);
+
+    // Immediate UI feedback — fires before we spawn, so the frontend can
+    // show a "launching" toast while Claude spins up (can take several seconds).
+    let _ = app.emit("quick_review_launched", serde_json::json!({ "url": url.clone() }));
+
+    tauri::async_runtime::spawn(async move {
+        let working_dir = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "E:\\develop\\code".to_string());
+        let prompt = format!("/pr-reviewer {}", url);
+        let mut session = match model {
+            Some(m) => claude_session::ClaudeSession::new_with_model(working_dir, m),
+            None => claude_session::ClaudeSession::new(working_dir),
+        };
+        match session.run_prompt(&prompt).await {
+            Ok(output) => {
+                plog!("[Pawkit] Quick review done: {}", &output.text[..output.text.len().min(200)]);
+                let _ = app.emit("quick_review_done", &serde_json::json!({
+                    "url": url,
+                    "success": true,
+                }));
+            }
+            Err(e) => {
+                plog!("[Pawkit] Quick review failed: {}", e);
+                let _ = app.emit("quick_review_done", &serde_json::json!({
+                    "url": url,
+                    "success": false,
+                    "error": e,
+                }));
+            }
+        }
+    });
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn slack_quick_reply(
+    link: Option<String>,
+    hint: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    let link = link
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let hint = hint
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if link.is_none() && hint.is_none() {
+        return Err("Slack 链接和提示词至少填一个".to_string());
+    }
+
+    plog!(
+        "[Pawkit] Slack quick reply: link={:?}, hint_len={}",
+        link,
+        hint.as_ref().map(|h| h.len()).unwrap_or(0)
+    );
+    let _ = app.emit("slack_quick_reply_launched", ());
+
+    tauri::async_runtime::spawn(async move {
+        let working_dir = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "E:\\develop\\code".to_string());
+
+        let mut prompt = String::from(
+            "使用 seesaw-slack skill 处理并回复 Slack 消息。\n\
+             要求：必须通过 Slack MCP 工具（mcp__claude_ai_Slack__*）发送消息，\
+             不要降级到 bot/webhook。如果 MCP 不可用，请明确报错而不是悄悄 fallback。",
+        );
+        if let Some(ref l) = link {
+            prompt.push_str(&format!("\n消息链接: {}", l));
+        }
+        if let Some(ref h) = hint {
+            prompt.push_str(&format!("\n附加提示: {}", h));
+        }
+
+        let mut session =
+            claude_session::ClaudeSession::new(working_dir).skip_permissions();
+        match session.run_prompt(&prompt).await {
+            Ok(output) => {
+                plog!(
+                    "[Pawkit] Slack quick reply done: {}",
+                    &output.text[..output.text.len().min(200)]
+                );
+                let _ = app.emit(
+                    "slack_quick_reply_done",
+                    &serde_json::json!({ "success": true }),
+                );
+            }
+            Err(e) => {
+                plog!("[Pawkit] Slack quick reply failed: {}", e);
+                let _ = app.emit(
+                    "slack_quick_reply_done",
+                    &serde_json::json!({ "success": false, "error": e }),
+                );
+            }
+        }
+    });
+
+    Ok(true)
+}
+
+#[tauri::command]
 fn reload_config(state: tauri::State<SharedConfig>) -> bool {
     let new_config = config::load_all_config();
     let mut config = state.lock().unwrap();
@@ -266,9 +382,10 @@ async fn show_context_menu(
     state: tauri::State<'_, SharedConfig>,
     away_flag: tauri::State<'_, AwayFlag>,
     green_flag: tauri::State<'_, GreenLightFlag>,
-    mention_mode_state: tauri::State<'_, mention_monitor::SharedMentionMode>,
     session_store_state: tauri::State<'_, Arc<tokio::sync::Mutex<SessionStore>>>,
     active_sessions: tauri::State<'_, hook_server::ActiveSessions>,
+    ar_enabled_flag: tauri::State<'_, AutoReviewEnabledFlag>,
+    ar_model_state: tauri::State<'_, AutoReviewModelState>,
 ) -> Result<(), String> {
     let actions = {
         let config = state.lock().unwrap();
@@ -276,7 +393,6 @@ async fn show_context_menu(
     };
     let is_away = away_flag.0.load(Ordering::SeqCst);
     let is_green = green_flag.0.load(Ordering::SeqCst);
-    let current_mention_mode = mention_mode_state.lock().await.clone();
 
     let app = window.app_handle();
 
@@ -308,43 +424,69 @@ async fn show_context_menu(
 
     // ── Slack 自动回复 submenu ──
     {
-        // Modes: (enum, menu_id, label)
-        let all_modes: [(mention_monitor::MentionMode, &str, &str); 3] = [
-            (mention_monitor::MentionMode::AutoReply, "_pawkit_mention_auto", "自动回复"),
-            (mention_monitor::MentionMode::Monitor, "_pawkit_mention_monitor", "手动审批"),
-            (mention_monitor::MentionMode::Rest, "_pawkit_mention_rest", "停用"),
-        ];
-
         let mut sub = SubmenuBuilder::new(app, "💬 Slack 自动回复");
-
-        // Current mode first (with ✓ marker, disabled)
-        for &(ref mode, id, label) in &all_modes {
-            if *mode == current_mention_mode {
-                let item = MenuItemBuilder::with_id(id, format!("{} ✓", label))
-                    .enabled(false)
-                    .build(app).map_err(|e| e.to_string())?;
-                sub = sub.item(&item);
-                break;
-            }
-        }
-        sub = sub.separator();
-        // Other modes
-        for &(ref mode, id, label) in &all_modes {
-            if *mode != current_mention_mode {
-                let item = MenuItemBuilder::with_id(id, label)
-                    .build(app).map_err(|e| e.to_string())?;
-                sub = sub.item(&item);
-            }
-        }
-
+        let item = MenuItemBuilder::with_id("_pawkit_slack_quick_reply", "🔗 快捷回复")
+            .build(app).map_err(|e| e.to_string())?;
+        sub = sub.item(&item);
         let submenu = sub.build().map_err(|e| e.to_string())?;
         menu_builder = menu_builder.item(&submenu);
     }
 
-    // Check PR
-    let check_pr_item = MenuItemBuilder::with_id("_pawkit_check_pr", "🔍 Check PR")
-        .build(app).map_err(|e| e.to_string())?;
-    menu_builder = menu_builder.item(&check_pr_item);
+    // ── Review PR submenu ──
+    {
+        let ar_on = ar_enabled_flag.0.load(Ordering::SeqCst);
+        let ar_model = ar_model_state.0.lock().await.clone();
+
+        let mut sub = SubmenuBuilder::new(app, "📋 Review PR");
+
+        if ar_on {
+            let item = MenuItemBuilder::with_id("_pawkit_ar_on", "开启 ✓")
+                .enabled(false).build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+            sub = sub.separator();
+            let item = MenuItemBuilder::with_id("_pawkit_ar_disable", "关闭")
+                .build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+        } else {
+            let item = MenuItemBuilder::with_id("_pawkit_ar_off", "关闭 ✓")
+                .enabled(false).build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+            sub = sub.separator();
+            let item = MenuItemBuilder::with_id("_pawkit_ar_enable", "开启")
+                .build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+        }
+
+        sub = sub.separator();
+
+        let is_sonnet = ar_model.as_deref() == Some("sonnet");
+        if is_sonnet {
+            let item = MenuItemBuilder::with_id("_pawkit_ar_opus", "Opus")
+                .build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+            let item = MenuItemBuilder::with_id("_pawkit_ar_sonnet_cur", "Sonnet ✓")
+                .enabled(false).build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+        } else {
+            let item = MenuItemBuilder::with_id("_pawkit_ar_opus_cur", "Opus ✓")
+                .enabled(false).build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+            let item = MenuItemBuilder::with_id("_pawkit_ar_sonnet", "Sonnet")
+                .build(app).map_err(|e| e.to_string())?;
+            sub = sub.item(&item);
+        }
+
+        sub = sub.separator();
+        let item = MenuItemBuilder::with_id("_pawkit_check_pr", "🔍 检查PR列表")
+            .build(app).map_err(|e| e.to_string())?;
+        sub = sub.item(&item);
+        let item = MenuItemBuilder::with_id("_pawkit_ar_quick", "🔗 快捷 Review")
+            .build(app).map_err(|e| e.to_string())?;
+        sub = sub.item(&item);
+
+        let submenu = sub.build().map_err(|e| e.to_string())?;
+        menu_builder = menu_builder.item(&submenu);
+    }
 
     // ── Recent Sessions submenu ──
     {
@@ -662,6 +804,10 @@ pub fn run() {
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let manual_poll_trigger: auto_review::ManualPollTrigger =
         Arc::new(tokio::sync::Notify::new());
+    let ar_enabled: auto_review::SharedAutoReviewEnabled =
+        Arc::new(AtomicBool::new(auto_review_config.enabled));
+    let ar_model: auto_review::SharedAutoReviewModel =
+        Arc::new(tokio::sync::Mutex::new(auto_review_config.model.clone()));
 
     // Load Slack config and create bridge (if configured)
     let slack_config = config::load_slack_config(&config_dir);
@@ -693,6 +839,8 @@ pub fn run() {
         .manage(session_allow_tools.clone())
         .manage(pending_review_items.clone())
         .manage(manual_poll_trigger.clone())
+        .manage(AutoReviewEnabledFlag(ar_enabled.clone()))
+        .manage(AutoReviewModelState(ar_model.clone()))
         .manage(mention_mode.clone())
         .invoke_handler(tauri::generate_handler![
             get_actions,
@@ -709,6 +857,8 @@ pub fn run() {
             trigger_check_pr,
             kill_session,
             get_active_sessions,
+            quick_review,
+            slack_quick_reply,
         ])
         .setup(move |app| {
             // Fix transparent window on Windows - clear both window and webview backgrounds
@@ -788,6 +938,8 @@ pub fn run() {
                 is_away.clone(),
                 manual_poll_trigger.clone(),
                 session_thread_map.clone(),
+                ar_enabled.clone(),
+                ar_model.clone(),
             );
 
             // Start mention monitor (independent of away mode)
@@ -910,6 +1062,8 @@ pub fn run() {
             let menu_trigger = manual_poll_trigger.clone();
             let session_thread_map = session_thread_map.clone();
             let menu_mention_mode = mention_mode.clone();
+            let menu_ar_enabled = ar_enabled.clone();
+            let menu_ar_model = ar_model.clone();
             app.on_menu_event(move |app, event| {
                 let id = event.id().as_ref().to_string();
 
@@ -938,33 +1092,16 @@ pub fn run() {
                     return;
                 }
                 if id == "_pawkit_check_pr" {
+                    // Emit started event immediately so the UI shows a thinking
+                    // bubble before the poll loop wakes (avoids perceived lag).
+                    let _ = app.emit("check_pr_started", ());
                     menu_trigger.notify_one();
                     plog!("[Pawkit] Manual check-pr triggered from menu");
                     return;
                 }
-                // Mention monitor mode switching
-                if id == "_pawkit_mention_monitor" {
-                    let mm = menu_mention_mode.clone();
-                    tauri::async_runtime::spawn(async move {
-                        *mm.lock().await = mention_monitor::MentionMode::Monitor;
-                    });
-                    plog!("[Pawkit] @mention 监听模式已开启");
-                    return;
-                }
-                if id == "_pawkit_mention_auto" {
-                    let mm = menu_mention_mode.clone();
-                    tauri::async_runtime::spawn(async move {
-                        *mm.lock().await = mention_monitor::MentionMode::AutoReply;
-                    });
-                    plog!("[Pawkit] @mention 自动回复已开启");
-                    return;
-                }
-                if id == "_pawkit_mention_rest" {
-                    let mm = menu_mention_mode.clone();
-                    tauri::async_runtime::spawn(async move {
-                        *mm.lock().await = mention_monitor::MentionMode::Rest;
-                    });
-                    plog!("[Pawkit] @mention 休息模式");
+                // Slack quick reply
+                if id == "_pawkit_slack_quick_reply" {
+                    let _ = app.emit("slack_quick_reply_prompt", ());
                     return;
                 }
                 // Green light toggle
@@ -978,6 +1115,37 @@ pub fn run() {
                     menu_green.store(false, Ordering::SeqCst);
                     let _ = app.emit("green_light_changed", false);
                     plog!("[Pawkit] 绿灯模式已关闭");
+                    return;
+                }
+                // Auto Review toggle
+                if id == "_pawkit_ar_enable" {
+                    menu_ar_enabled.store(true, Ordering::SeqCst);
+                    plog!("[Pawkit] Auto-review 已开启");
+                    return;
+                }
+                if id == "_pawkit_ar_disable" {
+                    menu_ar_enabled.store(false, Ordering::SeqCst);
+                    plog!("[Pawkit] Auto-review 已关闭");
+                    return;
+                }
+                if id == "_pawkit_ar_opus" {
+                    let model = menu_ar_model.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *model.lock().await = None;
+                    });
+                    plog!("[Pawkit] Auto-review 模型切换为 Opus");
+                    return;
+                }
+                if id == "_pawkit_ar_sonnet" {
+                    let model = menu_ar_model.clone();
+                    tauri::async_runtime::spawn(async move {
+                        *model.lock().await = Some("sonnet".to_string());
+                    });
+                    plog!("[Pawkit] Auto-review 模型切换为 Sonnet");
+                    return;
+                }
+                if id == "_pawkit_ar_quick" {
+                    let _ = app.emit("quick_review_prompt", ());
                     return;
                 }
                 // Kill specific session

@@ -315,6 +315,9 @@ pub struct AutoReviewConfig {
     /// Whether to auto-merge PRs after successful review (default: false)
     #[serde(default)]
     pub auto_merge: bool,
+    /// Model override for reviews (None = default/opus, Some("sonnet") for faster/cheaper)
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_review_interval() -> u64 { 5 }
@@ -328,6 +331,7 @@ impl Default for AutoReviewConfig {
             repo_dirs: HashMap::new(),
             gh_account: None,
             auto_merge: false,
+            model: None,
         }
     }
 }

@@ -111,6 +111,10 @@ pub type PendingReviewItems = Arc<Mutex<Vec<ReviewItem>>>;
 /// Manual trigger for immediate poll
 pub type ManualPollTrigger = Arc<Notify>;
 
+/// Shared runtime state for auto-review (togglable from context menu)
+pub type SharedAutoReviewEnabled = Arc<AtomicBool>;
+pub type SharedAutoReviewModel = Arc<tokio::sync::Mutex<Option<String>>>;
+
 /// Start the auto-review background system
 pub fn start_auto_review(
     app_handle: tauri::AppHandle,
@@ -120,12 +124,12 @@ pub fn start_auto_review(
     is_away: Arc<AtomicBool>,
     manual_trigger: ManualPollTrigger,
     session_thread_map: SessionThreadMap,
+    enabled: SharedAutoReviewEnabled,
+    model: SharedAutoReviewModel,
 ) {
-    if !config.enabled {
-        plog!("[Pawkit] Auto-review disabled");
-        return;
-    }
-    if config.repos.is_empty() {
+    if !enabled.load(Ordering::SeqCst) {
+        plog!("[Pawkit] Auto-review initially disabled (can be enabled from menu)");
+    } else if config.repos.is_empty() {
         plog!("[Pawkit] Auto-review enabled for ALL repos (no repo filter)");
     } else {
         plog!("[Pawkit] Auto-review enabled for repos: {:?}", config.repos);
@@ -142,10 +146,12 @@ pub fn start_auto_review(
     let poll_pending = pending_items.clone();
     let poll_slack = slack.clone();
     let poll_away = is_away.clone();
+    let poll_enabled = enabled.clone();
     let proc_config = config.clone();
     let proc_handle = app_handle.clone();
     let proc_slack = slack.clone();
     let proc_away = is_away.clone();
+    let proc_model = model.clone();
     tauri::async_runtime::spawn(async move {
         // Get GitHub token once at startup
         let token = match get_github_token(&poll_config.gh_account).await {
@@ -179,24 +185,47 @@ pub fn start_auto_review(
             // Initial short delay before first poll
             tokio::time::sleep(Duration::from_secs(10)).await;
 
+            let mut is_manual = false;
             loop {
-                if let Err(e) = poll_github(
-                    &client, &poll_handle, &poll_config, &poll_seen, &poll_pending,
-                    &poll_slack, &poll_away, &username,
-                ).await {
-                    plog!("[Pawkit] Auto-review poll error: {}", e);
+                if poll_enabled.load(Ordering::SeqCst) {
+                    // `check_pr_started` is emitted by the menu handler itself
+                    // for instant feedback — don't double-fire it here.
+                    let found = match poll_github(
+                        &client, &poll_handle, &poll_config, &poll_seen, &poll_pending,
+                        &poll_slack, &poll_away, &username,
+                    ).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            plog!("[Pawkit] Auto-review poll error: {}", e);
+                            0
+                        }
+                    };
+                    if is_manual {
+                        let _ = poll_handle.emit(
+                            "check_pr_finished",
+                            serde_json::json!({ "found": found }),
+                        );
+                    }
+                } else if is_manual {
+                    // Feature disabled — emit finished so the bubble/toast clears
+                    let _ = poll_handle.emit(
+                        "check_pr_finished",
+                        serde_json::json!({ "found": 0, "disabled": true }),
+                    );
                 }
+                is_manual = false;
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {},
                     _ = manual_trigger.notified() => {
                         plog!("[Pawkit] Manual check-pr triggered");
+                        is_manual = true;
                     },
                 }
             }
         });
 
         // Task 2: Process approved items with Claude Code
-        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away, &client2, session_thread_map, reviewed_commits).await;
+        process_approved_items(approved_rx, &proc_config, &proc_handle, &proc_slack, &proc_away, &client2, session_thread_map, reviewed_commits, proc_model).await;
     });
 
     // Store the sender so approved items can be sent from the Tauri command
@@ -320,6 +349,8 @@ async fn review_reply(slack: &SlackBridge, thread_ts: &Option<String>, msg: &str
 }
 
 /// Poll GitHub notifications for PR-related items.
+/// Returns the number of newly-surfaced review items (excludes items skipped
+/// because they were already seen, closed/merged, or already pending).
 async fn poll_github(
     client: &reqwest::Client,
     app_handle: &tauri::AppHandle,
@@ -329,7 +360,7 @@ async fn poll_github(
     slack: &Option<Arc<SlackBridge>>,
     is_away: &Arc<AtomicBool>,
     username: &str,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     plog!("[Pawkit] Polling GitHub notifications...");
 
     // Only fetch unread notifications. GitHub automatically marks notifications as
@@ -361,6 +392,7 @@ async fn poll_github(
         }
     }
 
+    let mut found_new: usize = 0;
     for notif in notifications {
         // Only handle PR-related notifications
         let subject_type = notif["subject"]["type"].as_str().unwrap_or("");
@@ -463,6 +495,7 @@ async fn poll_github(
             repo, pr_number, is_own_pr, reason);
         seen.lock().await.insert(item.id.clone());
         let thread_ts = notify_review_item(app_handle, &item, slack, is_away).await;
+        found_new += 1;
 
         if is_away.load(Ordering::SeqCst) {
             // In away mode: auto-approve and start review immediately
@@ -477,7 +510,7 @@ async fn poll_github(
         }
     }
 
-    Ok(())
+    Ok(found_new)
 }
 
 /// Fetch the latest comment on a PR/issue
@@ -593,6 +626,7 @@ async fn process_approved_items(
     client: &reqwest::Client,
     session_thread_map: SessionThreadMap,
     reviewed_commits: ReviewedCommits,
+    model: SharedAutoReviewModel,
 ) {
     while let Some(item) = rx.recv().await {
         plog!("[Pawkit] Processing approved review item: {} #{}", item.repo, item.pr_number);
@@ -662,7 +696,11 @@ async fn process_approved_items(
 
         let prompt = build_review_prompt(&item);
 
-        let mut session = ClaudeSession::new(working_dir);
+        let current_model = model.lock().await.clone();
+        let mut session = match current_model {
+            Some(m) => ClaudeSession::new_with_model(working_dir, m),
+            None => ClaudeSession::new(working_dir),
+        };
         match session.run_prompt(&prompt).await {
             Ok(output) => {
                 plog!("[Pawkit] Review complete for {} #{}: {}",

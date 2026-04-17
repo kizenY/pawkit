@@ -11,6 +11,9 @@ pub struct ClaudeSession {
     working_dir: String,
     /// Optional model override (e.g. "sonnet" for cheaper/faster tasks)
     model: Option<String>,
+    /// Pass --dangerously-skip-permissions so MCP tools (Slack, etc.)
+    /// work in non-interactive mode without per-tool approval prompts.
+    skip_permissions: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +32,7 @@ impl ClaudeSession {
             use_continue: false,
             working_dir,
             model: None,
+            skip_permissions: false,
         }
     }
 
@@ -39,6 +43,7 @@ impl ClaudeSession {
             use_continue: false,
             working_dir,
             model: Some(model),
+            skip_permissions: false,
         }
     }
 
@@ -50,6 +55,7 @@ impl ClaudeSession {
             use_continue: true,
             working_dir,
             model: None,
+            skip_permissions: false,
         }
     }
 
@@ -60,7 +66,16 @@ impl ClaudeSession {
             use_continue: false,
             working_dir,
             model: None,
+            skip_permissions: false,
         }
+    }
+
+    /// Enable --dangerously-skip-permissions so MCP tools work in
+    /// non-interactive mode. Use for user-triggered quick actions
+    /// where Pawkit itself represents the user's approval.
+    pub fn skip_permissions(mut self) -> Self {
+        self.skip_permissions = true;
+        self
     }
 
 
@@ -227,6 +242,10 @@ impl ClaudeSession {
             shell_cmd.push_str(&format!(" --resume {}", sid));
         } else if self.use_continue {
             shell_cmd.push_str(" --continue");
+        }
+
+        if self.skip_permissions {
+            shell_cmd.push_str(" --dangerously-skip-permissions");
         }
 
         let mut cmd = Command::new(&shell);
